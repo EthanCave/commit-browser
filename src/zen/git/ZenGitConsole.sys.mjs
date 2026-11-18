@@ -48,6 +48,17 @@ const HELP = [
     "restore [--all]",
     "send this tab (or every modified tab) back to its committed URL",
   ],
+  ["branch [name]", "list branches, or make one here (-d name deletes)"],
+  [
+    "switch <branch>",
+    "swap your tabs for that branch's layout (-c: new branch)",
+  ],
+  [
+    "checkout <branch|hash>",
+    "switch branch, or bring back an old commit's layout (-b: new branch)",
+  ],
+  ["stash [-m msg]", "set aside uncommitted tabs, back to the last commit"],
+  ["stash pop / list / drop", "bring stashed tabs back / list / discard"],
   ["remote add origin <url>", "connect a GitHub repo"],
   ["push / pull", "sync layouts with GitHub"],
   ["git <args>", "run any git command in the layouts repo"],
@@ -307,6 +318,10 @@ export class ZenGitConsole extends ZenUIComponent {
       pull: args => this.#git(["pull", "--ff-only", ...args]),
       remote: args => this.#git(["remote", ...(args.length ? args : ["-v"])]),
       git: args => this.#gitCommand(args),
+      branch: this.#branch,
+      switch: this.#switch,
+      checkout: this.#checkout,
+      stash: this.#stash,
       debug: this.#debug,
       clear: () => this.#output.replaceChildren(),
       history: () =>
@@ -443,7 +458,8 @@ export class ZenGitConsole extends ZenUIComponent {
 
   async #statusCmd() {
     const status = await ZenGitManager.refresh(this.window);
-    this.#print(`On branch main · ${ZenGitManager.repoDir}`, "dim");
+    const branch = (await ZenGitManager.repo.currentBranch()) || "main";
+    this.#print(`On branch ${branch} · ${ZenGitManager.repoDir}`, "dim");
     this.#printStatusLines(formatStatus(status, ZenGitManager.hasHead));
   }
 
@@ -470,7 +486,8 @@ export class ZenGitConsole extends ZenUIComponent {
     }
     const hash = await ZenGitManager.commit(this.window, message);
     if (hash) {
-      this.#print(`[main ${hash}] ${message}`, "added");
+      const branch = (await ZenGitManager.repo.currentBranch()) || "main";
+      this.#print(`[${branch} ${hash}] ${message}`, "added");
     } else {
       this.#print("Nothing to commit, layout clean.", "dim");
     }
@@ -561,6 +578,151 @@ export class ZenGitConsole extends ZenUIComponent {
     );
   }
 
+  #printResult({ summary, warnings }) {
+    this.#print(summary, "dim");
+    for (const warning of warnings) {
+      this.#print(`warning: ${warning}`, "modified");
+    }
+  }
+
+  async #branch(args) {
+    if (!args.length) {
+      const [branches, current] = await Promise.all([
+        ZenGitManager.repo.branches(),
+        ZenGitManager.repo.currentBranch(),
+      ]);
+      if (!branches.length) {
+        this.#print("No branches yet. Run `commit` first.", "dim");
+        return;
+      }
+      for (const name of branches) {
+        this.#print(
+          name === current ? `* ${name}` : `  ${name}`,
+          name === current ? "added" : ""
+        );
+      }
+      return;
+    }
+    if (args[0].startsWith("-")) {
+      // -d, -D, -m and friends behave exactly like git.
+      await this.#git(["branch", ...args]);
+      return;
+    }
+    await this.#git(["branch", args[0]]);
+  }
+
+  async #switch(args) {
+    const force = args.includes("-f") || args.includes("--discard-changes");
+    const rest = args.filter(a => a !== "-f" && a !== "--discard-changes");
+    if (rest[0] === "-c" || rest[0] === "-b") {
+      if (!rest[1]) {
+        this.#print(`usage: switch -c <new-branch>`, "error");
+        return;
+      }
+      await ZenGitManager.createBranch(rest[1]);
+      this.#print(
+        `Switched to a new branch '${rest[1]}' (your tabs are unchanged)`,
+        "added"
+      );
+      return;
+    }
+    if (!rest[0]) {
+      this.#print("usage: switch <branch>  ·  switch -c <new-branch>", "error");
+      return;
+    }
+    if ((await ZenGitManager.repo.revKind(rest[0])) !== "branch") {
+      this.#print(
+        `switch: no branch '${rest[0]}'. Make one with \`switch -c ${rest[0]}\`.`,
+        "error"
+      );
+      return;
+    }
+    await this.#checkout([rest[0], ...(force ? ["-f"] : [])]);
+  }
+
+  async #checkout(args) {
+    const force = args.includes("-f") || args.includes("--force");
+    const rest = args.filter(a => a !== "-f" && a !== "--force");
+    if (rest[0] === "-b") {
+      await this.#switch(["-c", ...rest.slice(1)]);
+      return;
+    }
+    if (rest[0] === "--" || rest[0] === ".") {
+      this.#print("To undo URL changes, use `restore --all`.", "dim");
+      return;
+    }
+    if (!rest[0]) {
+      this.#print("usage: checkout <branch|commit> [-f]", "error");
+      return;
+    }
+    const result = await ZenGitManager.checkout(this.window, rest[0], {
+      force,
+    });
+    if (result.kind === "branch") {
+      this.#print(`Switched to branch '${rest[0]}'`, "added");
+    } else {
+      const branch = await ZenGitManager.repo.currentBranch();
+      this.#print(
+        `Restored the layout from ${rest[0]}. You're still on '${branch}': ` +
+          "`commit` to keep it, or `checkout -f " +
+          branch +
+          "` to go back.",
+        "added"
+      );
+    }
+    this.#printResult(result);
+  }
+
+  async #stash(args) {
+    const [sub = "push", ...rest] = args;
+    switch (sub) {
+      case "list": {
+        const entries = await ZenGitManager.repo.stashList();
+        if (!entries.length) {
+          this.#print("No stashed layouts.", "dim");
+        }
+        for (const { ref, when, message } of entries) {
+          this.#print(`${ref}  ${when.padEnd(16)} ${message}`);
+        }
+        return;
+      }
+      case "pop":
+      case "apply": {
+        const force = rest.includes("-f");
+        const ref = rest.find(a => a !== "-f") || "stash@{0}";
+        const result = await ZenGitManager.stashPop(this.window, {
+          force,
+          ref,
+        });
+        this.#print(`Restored stashed tabs (${ref})`, "added");
+        this.#printResult(result);
+        return;
+      }
+      case "drop":
+      case "clear":
+        await this.#git(["stash", sub, ...rest]);
+        return;
+      case "push":
+      case "save":
+      default: {
+        // `stash -m msg` arrives with "-m" as the subcommand.
+        const { message } = extractMessage(
+          sub === "push" || sub === "save" ? rest : args
+        );
+        const result = await ZenGitManager.stash(this.window, message);
+        if (!result) {
+          this.#print("No local changes to stash.", "dim");
+          return;
+        }
+        this.#print(
+          "Stashed your tab changes. `stash pop` brings them back.",
+          "added"
+        );
+        this.#printResult(result);
+      }
+    }
+  }
+
   /**
    * `git <sub>` from muscle memory. Layout-aware subcommands go to the
    * console's own versions, which save the tabs before committing; the rest
@@ -575,7 +737,19 @@ export class ZenGitConsole extends ZenUIComponent {
       );
       return;
     }
-    const own = ["status", "diff", "commit", "log", "restore", "push", "pull"];
+    const own = [
+      "status",
+      "diff",
+      "commit",
+      "log",
+      "restore",
+      "push",
+      "pull",
+      "branch",
+      "switch",
+      "checkout",
+      "stash",
+    ];
     if (own.includes(sub)) {
       await this.#commands[sub].call(this, rest);
       return;

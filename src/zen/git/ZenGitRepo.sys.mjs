@@ -204,6 +204,150 @@ export class ZenGitRepo {
   }
 
   /**
+   * @returns {Promise<string|null>} The checked-out branch, or null.
+   */
+  async currentBranch() {
+    if (!(await this.isRepo())) {
+      return null;
+    }
+    const { exitCode, output } = await this.tryGit(
+      "symbolic-ref",
+      "--short",
+      "-q",
+      "HEAD"
+    );
+    return exitCode === 0 ? output.trim() : null;
+  }
+
+  /**
+   * @returns {Promise<string[]>} Local branch names.
+   */
+  async branches() {
+    if (!(await this.hasCommits())) {
+      return [];
+    }
+    const output = await this.git(
+      "for-each-ref",
+      "--format=%(refname:short)",
+      "refs/heads"
+    );
+    return output.split("\n").filter(Boolean);
+  }
+
+  /**
+   * Tells a branch name from a commit, the way `git checkout` must.
+   *
+   * @param {string} rev
+   * @returns {Promise<"branch"|"commit"|null>}
+   */
+  async revKind(rev) {
+    if (!(await this.hasCommits()) || rev.startsWith("-")) {
+      return null;
+    }
+    const branch = await this.tryGit(
+      "show-ref",
+      "--verify",
+      "-q",
+      `refs/heads/${rev}`
+    );
+    if (branch.exitCode === 0) {
+      return "branch";
+    }
+    const commit = await this.tryGit(
+      "rev-parse",
+      "--verify",
+      "-q",
+      `${rev}^{commit}`
+    );
+    return commit.exitCode === 0 ? "commit" : null;
+  }
+
+  /**
+   * Reads the snapshot currently written in the working tree.
+   *
+   * @returns {Promise<object>}
+   */
+  async readWorkingSnapshot() {
+    const files = {};
+    const essentials = this.#path("essentials.json");
+    if (await this.#fs.exists(essentials)) {
+      files["essentials.json"] = await this.#fs.read(essentials);
+    }
+    for (const name of await this.#fs.list(this.#path("spaces"))) {
+      if (name.endsWith(".json")) {
+        files[`spaces/${name}`] = await this.#fs.read(
+          this.#fs.join(this.#dir, "spaces", name)
+        );
+      }
+    }
+    return filesToSnapshot(files);
+  }
+
+  /**
+   * Puts the working tree back to HEAD. The tree only ever holds generated
+   * snapshot files, so nothing of the user's is lost.
+   */
+  async resetWorkingTree() {
+    await this.git("reset", "-q", "--hard");
+    await this.git("clean", "-q", "-fd");
+  }
+
+  /**
+   * Saves a snapshot as a stash entry.
+   *
+   * @param {object} snapshot
+   * @param {string} message
+   * @returns {Promise<boolean>} false when it matched HEAD.
+   */
+  async stashPush(snapshot, message) {
+    await this.writeSnapshot(snapshot);
+    await this.git("add", "-A");
+    const pending = await this.git("status", "--porcelain");
+    if (!pending.trim()) {
+      return false;
+    }
+    await this.git("stash", "push", "-q", "-m", message);
+    return true;
+  }
+
+  /**
+   * Reads a stash entry's snapshot without dropping it.
+   *
+   * @param {string} [ref]
+   * @returns {Promise<object>}
+   */
+  async readStash(ref = "stash@{0}") {
+    await this.resetWorkingTree();
+    try {
+      await this.git("stash", "apply", "-q", ref);
+      return await this.readWorkingSnapshot();
+    } finally {
+      await this.resetWorkingTree();
+    }
+  }
+
+  /**
+   * @returns {Promise<{ref: string, when: string, message: string}[]>}
+   */
+  async stashList() {
+    if (!(await this.hasCommits())) {
+      return [];
+    }
+    const output = await this.git(
+      "stash",
+      "list",
+      "--format=%gd%x1f%cr%x1f%gs"
+    );
+    return output
+      .split("\n")
+      .filter(Boolean)
+      .map(line => {
+        const [ref, when, message] = line.split("\x1f");
+        return { ref, when, message: message.replace(/^On [^:]+: /, "") };
+      });
+  }
+
+  /**
    * @param {number} [count]
    * @returns {Promise<{hash: string, when: string, subject: string}[]>}
    */

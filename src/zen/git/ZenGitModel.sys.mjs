@@ -475,6 +475,121 @@ export function summarize(status) {
 }
 
 /**
+ * @param {ReturnType<typeof computeStatus>} status
+ * @returns {boolean} Whether the layout matches the last commit.
+ */
+export function isClean(status) {
+  return (
+    !status.added.length && !status.modified.length && !status.deleted.length
+  );
+}
+
+/**
+ * Works out how to turn the live layout into a committed one, like the
+ * file operations behind `git checkout`. Tabs are matched by id so a tab
+ * that was only moved or navigated is updated in place rather than
+ * closed and reopened.
+ *
+ * @param {object} current Snapshot of the open tabs.
+ * @param {object} target Snapshot to restore.
+ * @returns {{
+ *   createSpaces: {id: string, name: string, icon: string|null}[],
+ *   createFolders: {id: string, name: string, parentId: string|null, spaceId: string}[],
+ *   open: object[],
+ *   update: {tab: object, changes: string[]}[],
+ *   close: object[],
+ * }} Tabs carry spaceId and essential, as from indexTabs.
+ */
+export function planCheckout(current, target) {
+  const now = indexTabs(current);
+  const goal = indexTabs(target);
+  const liveSpaces = new Set((current?.spaces || []).map(s => s.id));
+  const liveFolders = new Set(
+    (current?.spaces || []).flatMap(s => s.folders.map(f => f.id))
+  );
+  const plan = {
+    createSpaces: [],
+    createFolders: [],
+    open: [],
+    update: [],
+    close: [],
+  };
+
+  for (const space of target?.spaces || []) {
+    if (!liveSpaces.has(space.id)) {
+      plan.createSpaces.push({
+        id: space.id,
+        name: space.name,
+        icon: space.icon || null,
+      });
+    }
+    for (const folder of space.folders) {
+      if (!liveFolders.has(folder.id)) {
+        plan.createFolders.push({ ...folder, spaceId: space.id });
+      }
+    }
+  }
+
+  for (const [id, tab] of goal) {
+    const old = now.get(id);
+    if (!old) {
+      plan.open.push(tab);
+      continue;
+    }
+    const changes = [];
+    if (old.url !== tab.url) {
+      changes.push("url");
+    }
+    if (old.essential !== tab.essential) {
+      changes.push("essential");
+    }
+    if (!tab.essential && old.spaceId !== tab.spaceId) {
+      changes.push("space");
+    }
+    if ((old.folderId || null) !== (tab.folderId || null)) {
+      changes.push("folder");
+    }
+    if (old.pinned !== tab.pinned) {
+      changes.push("pinned");
+    }
+    if (changes.length) {
+      plan.update.push({ tab, changes });
+    }
+  }
+
+  for (const [id, tab] of now) {
+    if (!goal.has(id)) {
+      plan.close.push(tab);
+    }
+  }
+  return plan;
+}
+
+/**
+ * @param {ReturnType<typeof planCheckout>} plan
+ * @returns {string} e.g. "opened 3, closed 1, updated 2".
+ */
+export function summarizePlan(plan) {
+  const parts = [];
+  if (plan.open.length) {
+    parts.push(`opened ${plan.open.length}`);
+  }
+  if (plan.close.length) {
+    parts.push(`closed ${plan.close.length}`);
+  }
+  if (plan.update.length) {
+    parts.push(`updated ${plan.update.length}`);
+  }
+  if (plan.createSpaces.length) {
+    parts.push(`added ${plan.createSpaces.length} space(s)`);
+  }
+  if (plan.createFolders.length) {
+    parts.push(`added ${plan.createFolders.length} folder(s)`);
+  }
+  return parts.join(", ") || "already matched";
+}
+
+/**
  * Splits console input into arguments, honoring single and double quotes.
  *
  * @param {string} input

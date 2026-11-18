@@ -127,3 +127,67 @@ test("commit, read back, log, and drop removed spaces", async () => {
 
   await fs.rm(dir, { recursive: true, force: true });
 });
+
+test("branches, switching and revKind", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "zen-git-test-"));
+  const repo = new ZenGitRepo({
+    dir: path.join(dir, "layouts"),
+    exec,
+    fs: nodeFs,
+  });
+
+  await repo.commit(snapshot(["Work"]), "work");
+  assert.equal(await repo.currentBranch(), "main");
+  assert.equal(await repo.revKind("main"), "branch");
+  assert.equal(await repo.revKind("HEAD"), "commit");
+  assert.equal(await repo.revKind("nope"), null);
+  assert.equal(await repo.revKind("-f"), null);
+
+  await repo.resetWorkingTree();
+  await repo.git("switch", "-q", "-c", "fun");
+  await repo.commit(snapshot(["Games"]), "games");
+  assert.deepEqual(await repo.branches(), ["fun", "main"]);
+
+  await repo.resetWorkingTree();
+  await repo.git("switch", "-q", "main");
+  assert.deepEqual(await repo.readSnapshot(), snapshot(["Work"]));
+  assert.deepEqual(await repo.readSnapshot("fun"), snapshot(["Games"]));
+
+  await fs.rm(dir, { recursive: true, force: true });
+});
+
+test("stash saves a layout and reads it back without touching HEAD", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "zen-git-test-"));
+  const repo = new ZenGitRepo({
+    dir: path.join(dir, "layouts"),
+    exec,
+    fs: nodeFs,
+  });
+
+  const committed = snapshot(["Work"]);
+  await repo.commit(committed, "work");
+  assert.equal(
+    await repo.stashPush(committed, "nothing"),
+    false,
+    "matching HEAD stashes nothing"
+  );
+
+  const wip = snapshot(["Work", "Research"]);
+  assert.equal(await repo.stashPush(wip, "research tabs"), true);
+  assert.deepEqual(await repo.readWorkingSnapshot(), committed);
+
+  const list = await repo.stashList();
+  assert.equal(list.length, 1);
+  assert.equal(list[0].message, "research tabs");
+
+  assert.deepEqual(await repo.readStash(), wip);
+  assert.deepEqual(
+    await repo.readWorkingSnapshot(),
+    committed,
+    "reading a stash leaves the tree at HEAD"
+  );
+  assert.equal((await repo.stashList()).length, 1, "read does not drop");
+  assert.deepEqual(await repo.readSnapshot(), committed);
+
+  await fs.rm(dir, { recursive: true, force: true });
+});

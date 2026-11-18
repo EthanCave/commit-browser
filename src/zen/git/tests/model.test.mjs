@@ -12,13 +12,16 @@ import {
   extractMessage,
   filesToSnapshot,
   formatStatus,
+  isClean,
   isIgnored,
   parseIgnore,
+  planCheckout,
   resolveCdTarget,
   sanitizeUrl,
   snapshotToFiles,
   STATUS,
   summarize,
+  summarizePlan,
   tokenize,
 } from "../ZenGitModel.sys.mjs";
 
@@ -221,4 +224,50 @@ test("resolveCdTarget turns shell-style targets into URLs", () => {
   assert.equal(resolveCdTarget("..").kind, "back");
   assert.equal(resolveCdTarget("-").kind, "previous");
   assert.equal(resolveCdTarget("").kind, "home");
+});
+
+test("planCheckout opens, closes, updates and recreates by id", () => {
+  const target = buildSnapshot(sidebar);
+  const live = structuredClone(sidebar);
+  live.spaces = live.spaces.filter(s => s.uuid !== "space-home");
+  live.folders = [];
+  live.tabs = [
+    tab("t1", "https://github.com/somewhere-else"),
+    tab("t2", "https://mail.google.com/mail/u/0", { pinned: true }),
+    tab("t9", "https://news.ycombinator.com/"),
+  ];
+  const plan = planCheckout(buildSnapshot(live), target);
+
+  assert.deepEqual(
+    plan.createSpaces.map(s => s.name),
+    ["Home"]
+  );
+  assert.deepEqual(
+    plan.createFolders.map(f => [f.name, f.spaceId]),
+    [["Research", "space-work"]]
+  );
+  assert.deepEqual(
+    new Set(plan.open.map(t => t.id)),
+    new Set(["t3", "t4", "t6"])
+  );
+  assert.deepEqual(
+    plan.update.map(u => [u.tab.id, u.changes]),
+    [
+      ["t2", ["essential"]],
+      ["t1", ["url"]],
+    ]
+  );
+  assert.deepEqual(
+    plan.close.map(t => t.id),
+    ["t9"]
+  );
+  assert.equal(
+    summarizePlan(plan),
+    "opened 3, closed 1, updated 2, added 1 space(s), added 1 folder(s)"
+  );
+
+  const same = planCheckout(target, target);
+  assert.equal(summarizePlan(same), "already matched");
+  assert.ok(isClean(computeStatus(target, target)));
+  assert.ok(!isClean(computeStatus(buildSnapshot(live), target)));
 });
