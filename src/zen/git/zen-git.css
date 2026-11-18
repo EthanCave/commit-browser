@@ -1,0 +1,136 @@
+/* This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+
+:root {
+  /* Same meaning as git colors in VS Code: green = new, amber = changed. */
+  --zen-git-untracked: #3fb950;
+  --zen-git-modified: #d29922;
+  --zen-git-deleted: #f85149;
+}
+
+/* ---------- Status dots on tabs ---------- */
+
+.zen-git-dot {
+  display: none;
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  margin-inline: 4px;
+  border-radius: 50%;
+  pointer-events: auto;
+}
+
+.tabbrowser-tab[zen-git-status] .zen-git-dot {
+  display: block;
+}
+
+.tabbrowser-tab[zen-git-status="untracked"] .zen-git-dot {
+  background: var(--zen-git-untracked);
+}
+
+.tabbrowser-tab[zen-git-status="modified"] .zen-git-dot {
+  background: var(--zen-git-modified);
+}
+
+/* Essentials are an icon grid: show the dot as a corner badge instead. */
+.tabbrowser-tab[zen-essential] .tab-content {
+  position: relative;
+}
+
+.tabbrowser-tab[zen-essential] .zen-git-dot {
+  position: absolute;
+  top: 4px;
+  inset-inline-end: 4px;
+  margin: 0;
+}
+
+/* Hide the dot while hovering a normal tab so it never fights the close button. */
+.tabbrowser-tab:not([zen-essential]):hover .zen-git-dot {
+  display: none;
+}
+
+/* ---------- Console ---------- */
+
+#zen-git-console {
+  position: fixed;
+  inset-inline: 12px;
+  bottom: 12px;
+  z-index: 10000;
+  display: flex;
+  flex-direction: column;
+  max-height: 45vh;
+  border-radius: 10px;
+  background: color-mix(in srgb, #0d1117 94%, transparent);
+  color: #e6edf3;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+  font:
+    12px/1.5 ui-monospace,
+    "SF Mono",
+    Menlo,
+    monospace;
+  overflow: hidden;
+}
+
+#zen-git-console[hidden] {
+  display: none;
+}
+
+.zen-git-console-output {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 14px 4px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.zen-git-line.echo {
+  color: #7d8590;
+  margin-top: 6px;
+}
+
+.zen-git-line.dim {
+  color: #7d8590;
+}
+
+.zen-git-line.error {
+  color: var(--zen-git-deleted);
+}
+
+.zen-git-line.added {
+  color: var(--zen-git-untracked);
+}
+
+.zen-git-line.modified {
+  color: var(--zen-git-modified);
+}
+
+.zen-git-line.deleted {
+  color: var(--zen-git-deleted);
+}
+
+.zen-git-console-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.zen-git-console-prompt {
+  color: var(--zen-git-untracked);
+}
+
+.zen-git-console-input {
+  flex: 1;
+  appearance: none;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.zen-git-console-input::placeholder {
+  color: #484f58;
+}
