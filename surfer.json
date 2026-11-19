@@ -45,6 +45,19 @@
           "repo": "zen-browser/desktop"
         }
       }
+    },
+    "commit": {
+      "brandingGenericName": "Commit",
+      "backgroundColor": "#2C2C2A",
+      "brandShorterName": "Commit",
+      "brandShortName": "Commit",
+      "brandFullName": "Commit",
+      "release": {
+        "displayVersion": "0.1.0",
+        "github": {
+          "repo": "EthanCave/desktop"
+        }
+      }
     }
   },
   "license": {
