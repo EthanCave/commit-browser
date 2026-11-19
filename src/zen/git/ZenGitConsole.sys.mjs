@@ -14,6 +14,11 @@ import {
   tokenize,
 } from "./ZenGitModel.sys.mjs";
 
+const lazy = {};
+ChromeUtils.defineESModuleGetters(lazy, {
+  SearchService: "moz-src:///toolkit/components/search/SearchService.sys.mjs",
+});
+
 const HTML_NS = "http://www.w3.org/1999/xhtml";
 const MAX_OUTPUT_LINES = 500;
 
@@ -371,7 +376,7 @@ export class ZenGitConsole extends ZenUIComponent {
   }
 
   async #searchFor(query, where) {
-    const engine = await Services.search.getDefault();
+    const engine = await lazy.SearchService.getDefault();
     const url = engine.getSubmission(query).uri.spec;
     this.window.openTrustedLinkIn(url, where);
   }
@@ -660,6 +665,14 @@ export class ZenGitConsole extends ZenUIComponent {
     });
     if (result.kind === "branch") {
       this.#print(`Switched to branch '${rest[0]}'`, "added");
+      if (result.summary === "already matched") {
+        this.#print(
+          `'${rest[0]}' has the same layout you already had, so no tabs changed. ` +
+            "Open some tabs and `commit` on this branch to give it its own layout.",
+          "dim"
+        );
+        return;
+      }
     } else {
       const branch = await ZenGitManager.repo.currentBranch();
       this.#print(
