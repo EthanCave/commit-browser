@@ -1,0 +1,9 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+# macOS: create and use passkeys with Touch ID even without Apple's passkey
+# entitlement (see dom/webauthn/authrs_bridge/src/zen_touchid.rs). Requests
+# for a security key still go to USB keys.
+- name: zen.passkeys.touchid.enabled
+  value: true

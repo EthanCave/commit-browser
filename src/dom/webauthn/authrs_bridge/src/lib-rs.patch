@@ -1,0 +1,100 @@
+diff --git a/dom/webauthn/authrs_bridge/src/lib.rs b/dom/webauthn/authrs_bridge/src/lib.rs
+index 6e340691f92e14f94502ed29d56b59ba8f214ecc..b77e604b3cff78d1497bf217ffbf6a3284b86f20 100644
+--- a/dom/webauthn/authrs_bridge/src/lib.rs
++++ b/dom/webauthn/authrs_bridge/src/lib.rs
+@@ -52,6 +52,8 @@ mod about_webauthn_controller;
+ use about_webauthn_controller::*;
+ mod test_token;
+ use test_token::TestTokenManager;
++mod zen_touchid;
++use zen_touchid::ZenTouchId;
+ 
+ fn authrs_to_nserror(e: AuthenticatorError) -> nsresult {
+     match e {
+@@ -232,9 +234,7 @@ impl WebAuthnRegisterResult {
+         // hint as to which transports to try. In production, we only support the "usb" transport.
+         // In tests, the result is not very important, but we can at least return "internal" if
+         // we're simulating platform attachment.
+-        if static_prefs::pref!("security.webauth.webauthn_enable_softtoken")
+-            && self.result.borrow().attachment == AuthenticatorAttachment::Platform
+-        {
++        if self.result.borrow().attachment == AuthenticatorAttachment::Platform {
+             Ok(thin_vec![nsString::from("internal")])
+         } else {
+             Ok(thin_vec![nsString::from("usb")])
+@@ -709,6 +709,7 @@ pub struct AuthrsService {
+     usb_token_manager: Mutex<StateMachine>,
+     test_token_manager: TestTokenManager,
+     transaction: Arc<Mutex<Option<TransactionState>>>,
++    zen_touchid: ZenTouchId,
+ }
+ 
+ impl AuthrsService {
+@@ -762,6 +763,9 @@ impl AuthrsService {
+ 
+     xpcom_method!(get_is_uvpaa => GetIsUVPAA() -> bool);
+     fn get_is_uvpaa(&self) -> Result<bool, nsresult> {
++        if self.zen_touchid.enabled() {
++            return Ok(true);
++        }
+         if static_prefs::pref!("security.webauth.webauthn_enable_usbtoken") {
+             Ok(false)
+         } else if static_prefs::pref!("security.webauth.webauthn_enable_softtoken") {
+@@ -853,10 +857,13 @@ impl AuthrsService {
+             .to_result()
+             .is_ok()
+         {
+-            if authenticator_attachment.eq("platform") {
++            if authenticator_attachment.eq("platform") && !self.zen_touchid.enabled() {
+                 return Err(NS_ERROR_FAILURE);
+             }
+         }
++        // Touch ID handles everything except requests for a security key.
++        let use_touchid =
++            self.zen_touchid.enabled() && !authenticator_attachment.eq("cross-platform");
+ 
+         let mut credential_protection_policy = None;
+         let mut enforce_credential_protection_policy = None;
+@@ -1024,7 +1031,13 @@ impl AuthrsService {
+         // in parallel to any number of transports. We only support the USB transport in production
+         // configurations, so we do not need the full generality of `AuthenticatorService` here.
+         // We disable the USB transport in tests that use virtual devices.
+-        if static_prefs::pref!("security.webauth.webauthn_enable_usbtoken") {
++        if use_touchid {
++            self.zen_touchid.register(
++                info,
++                self.zen_touchid.filter_status(status_tx),
++                state_callback,
++            );
++        } else if static_prefs::pref!("security.webauth.webauthn_enable_usbtoken") {
+             // TODO(Bug 1855290) Remove this presence prompt
+             send_prompt(
+                 BrowserPromptType::Presence,
+@@ -1271,6 +1284,19 @@ impl AuthrsService {
+             }),
+         );
+ 
++        // Sign in with Touch ID when we hold a passkey for this site.
++        if self
++            .zen_touchid
++            .can_sign(&info.relying_party_id, &info.allow_list)
++        {
++            self.zen_touchid.sign(
++                info,
++                self.zen_touchid.filter_status(status_tx),
++                state_callback,
++            );
++            return Ok(());
++        }
++
+         // TODO(Bug 1855290) Remove this presence prompt
+         send_prompt(
+             BrowserPromptType::Presence,
+@@ -1691,6 +1717,7 @@ pub unsafe extern "C" fn authrs_service_constructor(
+         usb_token_manager: Mutex::new(StateMachine::new()),
+         test_token_manager: TestTokenManager::new(),
+         transaction: Arc::new(Mutex::new(None)),
++        zen_touchid: ZenTouchId::new(),
+     });
+ 
+     #[cfg(feature = "fuzzing")]
