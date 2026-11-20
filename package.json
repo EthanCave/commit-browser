@@ -9,7 +9,7 @@
   "scripts": {
     "build": "surfer build",
     "build:ui": "surfer build --ui",
-    "start": "find engine/obj-*/tmp -maxdepth 5 -type d -name startupCache -prune -exec rm -rf {} + ; cd engine && python3 ./mach run --noprofile",
+    "start": "if ps -axo comm | grep -q 'Commit.app/Contents/MacOS/zen$'; then echo 'Commit is already open. Quit it with Cmd+Q first (npm start would only open another window).'; exit 1; fi; find engine/obj-*/tmp -maxdepth 5 -type d -name startupCache -prune -exec rm -rf {} + ; cd engine && python3 ./mach run --noprofile",
     "start:bloat": "XPCOM_MEM_BLOAT_LOG=1 npm start",
     "import": "npm run ffprefs && npm run import:dumps && surfer import",
     "import:dumps": "python3 scripts/update_service_dumps.py",
