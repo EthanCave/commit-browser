@@ -75,6 +75,12 @@ zen-pinned-tab-edit-url-label = Enter the URL this pinned tab should point to:
 zen-tabs-renamed = Tab has been successfully renamed!
 zen-background-tab-opened-toast = New background tab opened!
 zen-zoom-changed-toast = Zoom: { NUMBER($percentage, style: "percent") }
+zen-tabs-archived-toast =
+    { $count ->
+        [one] Archived 1 old tab
+       *[other] Archived { $count } old tabs
+    }
+zen-tabs-archived-toast-description = Get them back from Library › History › Closed tabs
 zen-workspace-renamed-toast = Workspace has been successfully renamed!
 zen-split-view-limit-toast = Can't add more panels to the split view!
 zen-sidebar-drag-collapsed-toast = Sidebar hidden! Use <span>{ $shortcut }</span> to bring the sidebar back.

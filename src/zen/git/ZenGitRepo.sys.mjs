@@ -4,9 +4,9 @@
 
 import {
   DEFAULT_IGNORE_FILE,
-  filesToSnapshot,
+  WINDOW_CODEC,
   parseIgnore,
-  snapshotToFiles,
+  parseWorktrees,
 } from "./ZenGitModel.sys.mjs";
 
 /**
@@ -24,12 +24,13 @@ export class GitError extends Error {
 
 const README = `# Browser layouts
 
-Each commit in this repository is a snapshot of my browser's sidebar:
-spaces, folders, pinned tabs and open tabs.
+Every space in my browser has its own history here.
 
-- \`essentials.json\` holds the tabs pinned to the top grid.
-- \`spaces/<name>.json\` holds one space each.
+- Branches named \`spaces/<space>/<branch>\` hold one space's layout
+  (\`space.json\`: its folders, pinned tabs and open tabs).
 - \`.browserignore\` lists sites that are never committed.
+- Older commits (\`essentials.json\` + \`spaces/*.json\`) saved the whole
+  window at once.
 `;
 
 /**
@@ -41,20 +42,55 @@ spaces, folders, pinned tabs and open tabs.
  * exec(args, cwd) => Promise<{exitCode: number, output: string}>
  * fs: { join(...parts), exists(path), read(path), write(path, text),
  *       remove(path), mkdir(path), list(dir) => Promise<string[]> (names) }
+ *
+ * codec says which files hold a layout (see WINDOW_CODEC / spaceCodec).
+ * branchPrefix (e.g. "spaces/school") scopes branch names: callers use
+ * "main", git sees "spaces/school/main".
  */
 export class ZenGitRepo {
   #dir;
   #exec;
   #fs;
+  #codec;
+  #prefix;
 
-  constructor({ dir, exec, fs }) {
+  constructor({ dir, exec, fs, codec = WINDOW_CODEC, branchPrefix = "" }) {
     this.#dir = dir;
     this.#exec = exec;
     this.#fs = fs;
+    this.#codec = codec;
+    this.#prefix = branchPrefix ? branchPrefix.replace(/\/+$/, "") + "/" : "";
   }
 
   get dir() {
     return this.#dir;
+  }
+
+  get branchPrefix() {
+    return this.#prefix;
+  }
+
+  /**
+   * @param {string} name A branch name as the user types it.
+   * @returns {string} The real branch name in git.
+   */
+  fullBranch(name) {
+    return this.#prefix && !name.startsWith(this.#prefix)
+      ? this.#prefix + name
+      : name;
+  }
+
+  /**
+   * @param {string} full A real branch name.
+   * @returns {string|null} Its short name, or null if it is not ours.
+   */
+  shortBranch(full) {
+    if (!this.#prefix) {
+      return full;
+    }
+    return full.startsWith(this.#prefix)
+      ? full.slice(this.#prefix.length)
+      : null;
   }
 
   #path(relative) {
@@ -148,20 +184,20 @@ export class ZenGitRepo {
     if (!(await this.isRepo())) {
       return null;
     }
+    if (this.#prefix && (await this.revKind(rev)) === "branch") {
+      rev = this.fullBranch(rev);
+    }
     const tree = await this.tryGit("ls-tree", "-r", "--name-only", rev);
     if (tree.exitCode !== 0) {
       return null;
     }
     const files = {};
     for (const path of tree.output.split("\n")) {
-      if (
-        path === "essentials.json" ||
-        (path.startsWith("spaces/") && path.endsWith(".json"))
-      ) {
+      if (this.#codec.wants(path)) {
         files[path] = await this.git("show", `${rev}:${path}`);
       }
     }
-    return filesToSnapshot(files);
+    return this.#codec.fromFiles(files);
   }
 
   /**
@@ -171,12 +207,15 @@ export class ZenGitRepo {
    * @param {object} snapshot
    */
   async writeSnapshot(snapshot) {
-    const files = snapshotToFiles(snapshot);
-    const spacesDir = this.#path("spaces");
-    await this.#fs.mkdir(spacesDir);
-    for (const name of await this.#fs.list(spacesDir)) {
-      if (name.endsWith(".json") && !(`spaces/${name}` in files)) {
-        await this.#fs.remove(this.#fs.join(spacesDir, name));
+    const files = this.#codec.toFiles(snapshot);
+    const { staleDir } = this.#codec;
+    if (staleDir) {
+      const dir = this.#path(staleDir);
+      await this.#fs.mkdir(dir);
+      for (const name of await this.#fs.list(dir)) {
+        if (name.endsWith(".json") && !(`${staleDir}/${name}` in files)) {
+          await this.#fs.remove(this.#fs.join(dir, name));
+        }
       }
     }
     for (const [path, text] of Object.entries(files)) {
@@ -216,7 +255,7 @@ export class ZenGitRepo {
       "-q",
       "HEAD"
     );
-    return exitCode === 0 ? output.trim() : null;
+    return exitCode === 0 ? this.shortBranch(output.trim()) : null;
   }
 
   /**
@@ -229,9 +268,13 @@ export class ZenGitRepo {
     const output = await this.git(
       "for-each-ref",
       "--format=%(refname:short)",
-      "refs/heads"
+      `refs/heads/${this.#prefix}`.replace(/\/$/, "")
     );
-    return output.split("\n").filter(Boolean);
+    return output
+      .split("\n")
+      .filter(Boolean)
+      .map(name => this.shortBranch(name))
+      .filter(Boolean);
   }
 
   /**
@@ -248,7 +291,7 @@ export class ZenGitRepo {
       "show-ref",
       "--verify",
       "-q",
-      `refs/heads/${rev}`
+      `refs/heads/${this.fullBranch(rev)}`
     );
     if (branch.exitCode === 0) {
       return "branch";
@@ -269,18 +312,16 @@ export class ZenGitRepo {
    */
   async readWorkingSnapshot() {
     const files = {};
-    const essentials = this.#path("essentials.json");
-    if (await this.#fs.exists(essentials)) {
-      files["essentials.json"] = await this.#fs.read(essentials);
-    }
+    const candidates = ["essentials.json", "space.json"];
     for (const name of await this.#fs.list(this.#path("spaces"))) {
-      if (name.endsWith(".json")) {
-        files[`spaces/${name}`] = await this.#fs.read(
-          this.#fs.join(this.#dir, "spaces", name)
-        );
+      candidates.push(`spaces/${name}`);
+    }
+    for (const path of candidates) {
+      if (this.#codec.wants(path) && (await this.#fs.exists(this.#path(path)))) {
+        files[path] = await this.#fs.read(this.#path(path));
       }
     }
-    return filesToSnapshot(files);
+    return this.#codec.fromFiles(files);
   }
 
   /**
@@ -327,7 +368,10 @@ export class ZenGitRepo {
   }
 
   /**
-   * @returns {Promise<{ref: string, when: string, message: string}[]>}
+   * Stashes made on this repo's branches. git keeps one stash list for all
+   * worktrees, but tags each entry with its branch ("On <branch>: msg").
+   *
+   * @returns {Promise<{ref: string, when: string, message: string, branch: string|null}[]>}
    */
   async stashList() {
     if (!(await this.hasCommits())) {
@@ -342,9 +386,80 @@ export class ZenGitRepo {
       .split("\n")
       .filter(Boolean)
       .map(line => {
-        const [ref, when, message] = line.split("\x1f");
-        return { ref, when, message: message.replace(/^On [^:]+: /, "") };
-      });
+        const [ref, when, subject] = line.split("\x1f");
+        const match = /^(?:On|WIP on) ([^:]+): (.*)$/s.exec(subject);
+        const full = match ? match[1] : null;
+        return {
+          ref,
+          when,
+          message: match ? match[2] : subject,
+          branch: full === null ? null : this.shortBranch(full),
+          ours: full === null ? !this.#prefix : !!this.shortBranch(full),
+        };
+      })
+      .filter(entry => entry.ours)
+      .map(({ ours, ...entry }) => entry);
+  }
+
+  // -------------------------------------------------------------------------
+  // Worktrees (used on the shared repo)
+
+  /**
+   * @returns {Promise<{path: string, branch: string|null}[]>}
+   */
+  async worktrees() {
+    if (!(await this.isRepo())) {
+      return [];
+    }
+    return parseWorktrees(await this.git("worktree", "list", "--porcelain"));
+  }
+
+  /**
+   * @param {string} name A full branch name.
+   * @returns {Promise<boolean>}
+   */
+  async hasBranch(name) {
+    const { exitCode } = await this.tryGit(
+      "show-ref",
+      "--verify",
+      "-q",
+      `refs/heads/${name}`
+    );
+    return exitCode === 0;
+  }
+
+  /**
+   * Checks a branch out in a new worktree, creating it as an empty (orphan)
+   * branch when it does not exist yet.
+   *
+   * @param {string} path
+   * @param {string} branch Full branch name.
+   * @returns {Promise<"existing"|"orphan">}
+   */
+  async addWorktree(path, branch) {
+    await this.tryGit("worktree", "prune");
+    if (await this.hasBranch(branch)) {
+      await this.git("worktree", "add", "-q", path, branch);
+      return "existing";
+    }
+    await this.git("worktree", "add", "-q", "--orphan", "-b", branch, path);
+    return "orphan";
+  }
+
+  /**
+   * Keeps the shared repo from seeing the worktrees nested inside it.
+   *
+   * @param {string} pattern e.g. ".spaces/"
+   */
+  async excludeLocally(pattern) {
+    const path = this.#path(".git/info/exclude");
+    const text = (await this.#fs.exists(path)) ? await this.#fs.read(path) : "";
+    if (!text.split("\n").includes(pattern)) {
+      await this.#fs.write(
+        path,
+        text + (text && !text.endsWith("\n") ? "\n" : "") + pattern + "\n"
+      );
+    }
   }
 
   /**

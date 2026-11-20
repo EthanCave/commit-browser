@@ -1,0 +1,27 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at http://mozilla.org/MPL/2.0/.
+
+# Commit builds should not open Zen's welcome, privacy-policy and what's-new
+# pages. surfer's branding step hard-codes those URLs for every brand, so we
+# skip the first-run/upgrade page logic instead.
+- name: browser.startup.homepage_override.mstone
+  value: "ignore"
+
+# The address bar only offers "Switch to tab" for tabs in the current space.
+- name: zen.urlbar.switch-to-tab.current-space-only
+  value: true
+
+# Pressing Cmd+T while the floating new-tab bar is open keeps it open (and
+# selects what was typed) instead of closing it into the sidebar address bar.
+- name: zen.urlbar.newtab-shortcut-closes
+  value: false
+
+# Per-site style fixes for pages that look broken in Gecko (src/zen/sitefixes).
+- name: zen.site-fixes.enabled
+  value: true
+
+# The fullscreen notice (restyled as a small pill in zen-single-components.css)
+# goes away after 1.5 s instead of 3.
+- name: full-screen-api.warning.timeout
+  value: 1500

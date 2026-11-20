@@ -7,11 +7,14 @@ EXTRA_PP_COMPONENTS += [
 ]
 
 DIRS += [
+    "adblock",
+    "archive",
     "boosts",
     "common",
     "compact-mode",
     "drag-and-drop",
     "git",
+    "sitefixes",
     "glance",
     "kbs",
     "library",

@@ -116,6 +116,14 @@ export class nsZenUrlbarController {
 
     // Close the new tab popup on cmd/ctrl + t
     if (!overridePreferance && gURLBar.hasAttribute("zen-newtab")) {
+      // Commit: pressing cmd/ctrl + t again keeps the floating bar and
+      // selects what was typed; Escape is what closes it.
+      if (
+        !Services.prefs.getBoolPref("zen.urlbar.newtab-shortcut-closes", false)
+      ) {
+        document.getElementById("Browser:OpenLocation").doCommand();
+        return true;
+      }
       // The _zenHandleUrlbarClose holds a token in it's closure.
       // Call that instead.
       if (gURLBar._zenHandleUrlbarClose) {

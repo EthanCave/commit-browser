@@ -9,6 +9,7 @@ EXTRA_JS_MODULES += [
   "ZenUBProvider.sys.mjs",
   "ZenUBResultsLearner.sys.mjs",
   "ZenUBSidebarProvider.sys.mjs",
+  "ZenUrlbarSpaceTabs.sys.mjs",
 ]
 
 EXTRA_JS_MODULES.zen.urlbar += [

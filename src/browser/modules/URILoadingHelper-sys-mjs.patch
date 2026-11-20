@@ -1,8 +1,16 @@
 diff --git a/browser/modules/URILoadingHelper.sys.mjs b/browser/modules/URILoadingHelper.sys.mjs
-index 6f88bf621d9c423954d59deb2798fb37303dd04e..8363aebbc50d12c89594144e44ca9d9d785446de 100644
+index 6f88bf621d9c423954d59deb2798fb37303dd04e..b909930934bc117db78f1922e735f750a7053ca4 100644
 --- a/browser/modules/URILoadingHelper.sys.mjs
 +++ b/browser/modules/URILoadingHelper.sys.mjs
-@@ -252,6 +252,7 @@ function openInWindow(url, params, sourceWindow) {
+@@ -11,6 +11,7 @@ const lazy = {};
+ ChromeUtils.defineESModuleGetters(lazy, {
+   AboutNewTab: "resource:///modules/AboutNewTab.sys.mjs",
+   BrowserWindowTracker: "resource:///modules/BrowserWindowTracker.sys.mjs",
++  ZenUrlbarSpaceTabs: "resource:///modules/ZenUrlbarSpaceTabs.sys.mjs",
+   handleBounceEventTrigger:
+     "moz-src:///browser/components/urlbar/UrlbarParentController.sys.mjs",
+ });
+@@ -252,6 +253,7 @@ function openInWindow(url, params, sourceWindow) {
      features,
      sa
    );
@@ -10,7 +18,7 @@ index 6f88bf621d9c423954d59deb2798fb37303dd04e..8363aebbc50d12c89594144e44ca9d9d
  }
  
  function openInCurrentTab(targetBrowser, url, uriObj, params) {
-@@ -572,7 +573,7 @@ export const URILoadingHelper = {
+@@ -572,7 +574,7 @@ export const URILoadingHelper = {
        // page. If a load request bounces off for the currently selected tab,
        // we'll open a new tab instead.
        let tab = w.gBrowser.getTabForBrowser(targetBrowser);
@@ -19,16 +27,28 @@ index 6f88bf621d9c423954d59deb2798fb37303dd04e..8363aebbc50d12c89594144e44ca9d9d
          where = "tab";
          targetBrowser = null;
        } else if (
-@@ -1029,7 +1030,7 @@ export const URILoadingHelper = {
+@@ -1029,7 +1031,10 @@ export const URILoadingHelper = {
          ignoreQueryString || replaceQueryString,
          ignoreFragmentWhenComparing
        );
 -      let browsers = aWindow.gBrowser.browsers;
-+      let browsers = aWindow.gZenWorkspaces.allUsedBrowsers;
++      let browsers = lazy.ZenUrlbarSpaceTabs.activeSpaceFirst(
++        aWindow,
++        aWindow.gZenWorkspaces.allUsedBrowsers
++      );
        for (let i = 0; i < browsers.length; i++) {
          let browser = browsers[i];
          let browserCompare = cleanURL(
-@@ -1085,7 +1086,7 @@ export const URILoadingHelper = {
+@@ -1076,7 +1081,7 @@ export const URILoadingHelper = {
+ 
+           if (!doAdopt) {
+             if (aSplitView) {
+-              let tabToMove = aWindow.gBrowser.tabs[i];
++              let tabToMove = aWindow.gBrowser.getTabForBrowser(browser);
+               if (aSplitView.tabs.includes(tabToMove)) {
+                 aWindow.gBrowser.selectedTab = tabToMove;
+               } else {
+@@ -1085,7 +1090,7 @@ export const URILoadingHelper = {
                }
                aSplitView.documentGlobal.focus();
              } else {

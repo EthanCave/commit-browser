@@ -322,6 +322,245 @@ export function filesToSnapshot(files) {
   return snapshot;
 }
 
+// ---------------------------------------------------------------------------
+// One history per space
+//
+// Each space has its own branches, named spaces/<slug>/<branch>, checked out
+// in its own git worktree. Those branches hold a single space.json. The
+// whole-window format above (essentials.json + spaces/*.json) is what older
+// commits used; a space can still read its part of one of those.
+
+export const SPACE_FILE = "space.json";
+export const SPACE_BRANCH_ROOT = "spaces";
+export const DEFAULT_SPACE_BRANCH = "main";
+
+/**
+ * @param {string} slug A space's slug, from slugify(name).
+ * @returns {string} The ref prefix for its branches, e.g. "spaces/school".
+ */
+export function spaceBranchPrefix(slug) {
+  return `${SPACE_BRANCH_ROOT}/${slug}`;
+}
+
+/**
+ * Cuts a whole-window snapshot down to one space, without Essentials (they
+ * show in every space, so no single space's history owns them).
+ *
+ * @param {object} snapshot From buildSnapshot.
+ * @param {string} spaceId
+ * @returns {object} A snapshot with exactly one space.
+ */
+export function spaceSnapshot(snapshot, spaceId) {
+  const space = (snapshot?.spaces || []).find(s => s.id === spaceId) || {
+    id: spaceId,
+    name: "Untitled space",
+    icon: null,
+    folders: [],
+    tabs: [],
+  };
+  return {
+    version: snapshot?.version ?? SNAPSHOT_VERSION,
+    essentials: [],
+    spaces: [space],
+  };
+}
+
+/**
+ * Points a stored one-space snapshot at a live space, so restoring it changes
+ * tabs in that space instead of recreating the space it was saved from
+ * (whose id differs on another computer, or after a space is recreated).
+ *
+ * @param {object} snapshot A one-space snapshot.
+ * @param {{id: string, name: string, icon?: string|null}} live
+ * @returns {object}
+ */
+export function retargetSpace(snapshot, live) {
+  const stored = snapshot?.spaces?.[0] || { folders: [], tabs: [] };
+  return {
+    version: snapshot?.version ?? SNAPSHOT_VERSION,
+    essentials: [],
+    spaces: [
+      {
+        ...stored,
+        id: live.id,
+        name: live.name,
+        icon: live.icon ?? stored.icon ?? null,
+      },
+    ],
+  };
+}
+
+const toJson = value => JSON.stringify(value, null, 2) + "\n";
+
+/**
+ * How snapshots map to files, for a whole window (older commits) or for one
+ * space. `fromFiles` returns null when the files hold no layout.
+ */
+export const WINDOW_CODEC = Object.freeze({
+  wants: path =>
+    path === "essentials.json" ||
+    (path.startsWith("spaces/") && path.endsWith(".json")),
+  toFiles: snapshot => snapshotToFiles(snapshot),
+  fromFiles: files => filesToSnapshot(files),
+  staleDir: "spaces",
+});
+
+/**
+ * @param {string} slug The space's slug; also finds its part of an older
+ *   whole-window commit (spaces/<slug>.json).
+ * @returns {object} A codec for one space's branches.
+ */
+export function spaceCodec(slug) {
+  const legacy = `spaces/${slug}.json`;
+  return Object.freeze({
+    wants: path => path === SPACE_FILE || path === legacy,
+    toFiles: snapshot => ({
+      [SPACE_FILE]: toJson({ version: snapshot.version, ...snapshot.spaces[0] }),
+    }),
+    fromFiles: files => {
+      const text = files?.[SPACE_FILE] ?? files?.[legacy];
+      if (text === undefined) {
+        return null;
+      }
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch {
+        return null;
+      }
+      const { version = SNAPSHOT_VERSION, position, ...space } = data;
+      return {
+        version,
+        essentials: [],
+        spaces: [{ folders: [], tabs: [], ...space }],
+      };
+    },
+    staleDir: null,
+  });
+}
+
+// Essentials show in every space, so they have their own history on
+// essentials/<branch>, in the same essentials.json format older whole-window
+// commits used.
+export const ESSENTIALS_BRANCH_PREFIX = "essentials";
+export const ESSENTIALS_FILE = "essentials.json";
+
+/**
+ * @param {object} snapshot A whole-window snapshot.
+ * @returns {object} A snapshot holding only its Essentials.
+ */
+export function essentialsSnapshot(snapshot) {
+  return {
+    version: snapshot?.version ?? SNAPSHOT_VERSION,
+    essentials: [...(snapshot?.essentials || [])],
+    spaces: [],
+  };
+}
+
+export const ESSENTIALS_CODEC = Object.freeze({
+  wants: path => path === ESSENTIALS_FILE,
+  toFiles: snapshot => ({
+    [ESSENTIALS_FILE]: toJson({
+      version: snapshot.version,
+      tabs: snapshot.essentials,
+    }),
+  }),
+  fromFiles: files => {
+    const text = files?.[ESSENTIALS_FILE];
+    if (text === undefined) {
+      return null;
+    }
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch {
+      return null;
+    }
+    return {
+      version: data.version ?? SNAPSHOT_VERSION,
+      essentials: data.tabs || [],
+      spaces: [],
+    };
+  },
+  staleDir: null,
+});
+
+// Settings every computer should share, such as each space's default branch,
+// live on their own small branch, settings/main, so `push` and `pull` carry
+// them.
+export const SETTINGS_BRANCH_PREFIX = "settings";
+export const SETTINGS_FILE = "settings.json";
+
+/**
+ * @param {object} [settings]
+ * @returns {{version: number, defaults: Object<string, string>}} Settings
+ *   with every field present.
+ */
+export function normalizeSettings(settings) {
+  return {
+    version: settings?.version ?? SNAPSHOT_VERSION,
+    defaults: { ...(settings?.defaults || {}) },
+  };
+}
+
+export const SETTINGS_CODEC = Object.freeze({
+  wants: path => path === SETTINGS_FILE,
+  toFiles: settings => ({
+    [SETTINGS_FILE]: toJson(normalizeSettings(settings)),
+  }),
+  fromFiles: files => {
+    const text = files?.[SETTINGS_FILE];
+    if (text === undefined) {
+      return null;
+    }
+    try {
+      return normalizeSettings(JSON.parse(text));
+    } catch {
+      return null;
+    }
+  },
+  staleDir: null,
+});
+
+/**
+ * Combines per-space statuses, for the dots and `ls -a`.
+ *
+ * @param {ReturnType<typeof computeStatus>[]} statuses
+ * @returns {ReturnType<typeof computeStatus>}
+ */
+export function mergeStatuses(statuses) {
+  const merged = { tabs: new Map(), added: [], modified: [], deleted: [] };
+  for (const status of statuses) {
+    for (const [id, state] of status.tabs) {
+      merged.tabs.set(id, state);
+    }
+    merged.added.push(...status.added);
+    merged.modified.push(...status.modified);
+    merged.deleted.push(...status.deleted);
+  }
+  return merged;
+}
+
+/**
+ * Parses `git worktree list --porcelain`.
+ *
+ * @param {string} output
+ * @returns {{path: string, branch: string|null}[]}
+ */
+export function parseWorktrees(output) {
+  const worktrees = [];
+  let current = null;
+  for (const line of (output || "").split("\n")) {
+    if (line.startsWith("worktree ")) {
+      current = { path: line.slice("worktree ".length), branch: null };
+      worktrees.push(current);
+    } else if (current && line.startsWith("branch ")) {
+      current.branch = line.slice("branch ".length).replace(/^refs\/heads\//, "");
+    }
+  }
+  return worktrees;
+}
+
 /**
  * @param {object} snapshot
  * @returns {Map<string, object>} Every tab by id, with its space and folder.
@@ -651,6 +890,44 @@ export function extractMessage(args) {
   return { message, rest };
 }
 
+/**
+ * Picks the site a bare `cd <name>` most likely means from history origins
+ * (moz_origins rows): a host whose first label is the name, optionally after
+ * "www.", ranked by frecency, then by being closest to <name>.<tld>.
+ * "krillion" -> krillion.io, "canvas" -> canvas.rice.edu.
+ *
+ * @param {string} name A bare name, lowercase.
+ * @param {{prefix: string, host: string, frecency: number}[]} rows
+ * @returns {string|null} The origin, e.g. "https://krillion.io", or null.
+ */
+export function pickHistoryOrigin(name, rows) {
+  const candidates = [];
+  for (const { prefix, host, frecency } of rows || []) {
+    if (!/^https?:\/\/$/.test(prefix)) {
+      continue;
+    }
+    const bare = host.toLowerCase().replace(/^www\./, "");
+    if (!bare.startsWith(`${name}.`)) {
+      continue;
+    }
+    const rest = bare.slice(name.length + 1);
+    const dots = rest.split(".").length - 1;
+    // name.tld or name.site.tld (canvas.rice.edu), not deeper.
+    if (!rest || dots > 1) {
+      continue;
+    }
+    candidates.push({ origin: prefix + host, frecency, dots, https: prefix === "https://", length: host.length });
+  }
+  candidates.sort(
+    (a, b) =>
+      b.frecency - a.frecency ||
+      a.dots - b.dots ||
+      b.https - a.https ||
+      a.length - b.length
+  );
+  return candidates[0]?.origin ?? null;
+}
+
 // Short names `cd` understands without a dot. Anything else without a dot
 // becomes <name>.com.
 export const SITE_SHORTCUTS = Object.freeze({
@@ -669,7 +946,9 @@ export const SITE_SHORTCUTS = Object.freeze({
  * Works out what `cd <target>` should open.
  *
  * @param {string} target Everything after `cd`.
- * @returns {{kind: "url", url: string} | {kind: "search", query: string} | {kind: "back"|"forward"|"previous"|"home"}}
+ * @returns {{kind: "url", url: string, guess?: {name: string, path: string}} | {kind: "search", query: string} | {kind: "back"|"forward"|"previous"|"home"}}
+ *   `guess` is set when a bare name became <name>.com, which history may
+ *   know better.
  */
 export function resolveCdTarget(target) {
   target = (target || "").trim();
@@ -704,7 +983,18 @@ export function resolveCdTarget(target) {
     return { kind: "url", url: `http://${host}${path}` };
   }
   if (!host.includes(".")) {
-    host = SITE_SHORTCUTS[host.toLowerCase()] || `${host.toLowerCase()}.com`;
+    const name = host.toLowerCase();
+    if (SITE_SHORTCUTS[name]) {
+      host = SITE_SHORTCUTS[name];
+    } else {
+      // A guess: the console first looks for a site with this name in your
+      // history (krillion -> krillion.io), like the address bar's autofill.
+      return {
+        kind: "url",
+        url: `https://${name}.com${path}`,
+        guess: { name, path },
+      };
+    }
   }
   return { kind: "url", url: `https://${host}${path}` };
 }

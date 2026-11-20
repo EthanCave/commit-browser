@@ -1,0 +1,4 @@
+# Built-in ad blocker (src/zen/adblock): uBlock Origin, installed once from
+# addons.mozilla.org. Set enabled to false to never install it.
+- name: zen.adblock.enabled
+  value: true

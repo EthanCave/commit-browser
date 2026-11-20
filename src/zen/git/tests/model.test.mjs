@@ -16,6 +16,7 @@ import {
   isIgnored,
   parseIgnore,
   planCheckout,
+  pickHistoryOrigin,
   resolveCdTarget,
   sanitizeUrl,
   snapshotToFiles,
@@ -196,10 +197,12 @@ test("resolveCdTarget turns shell-style targets into URLs", () => {
   assert.deepEqual(resolveCdTarget("github"), {
     kind: "url",
     url: "https://github.com",
+    guess: { name: "github", path: "" },
   });
-  assert.deepEqual(resolveCdTarget("github/anthropics"), {
+  assert.deepEqual(resolveCdTarget("Krillion/docs"), {
     kind: "url",
-    url: "https://github.com/anthropics",
+    url: "https://krillion.com/docs",
+    guess: { name: "krillion", path: "/docs" },
   });
   assert.deepEqual(resolveCdTarget("gh/zen-browser"), {
     kind: "url",
@@ -270,4 +273,24 @@ test("planCheckout opens, closes, updates and recreates by id", () => {
   assert.equal(summarizePlan(same), "already matched");
   assert.ok(isClean(computeStatus(target, target)));
   assert.ok(!isClean(computeStatus(buildSnapshot(live), target)));
+});
+
+test("pickHistoryOrigin finds the site a bare name means", () => {
+  const rows = [
+    { prefix: "https://", host: "krillion.io", frecency: 120 },
+    { prefix: "https://", host: "krillion.com", frecency: 5 },
+    { prefix: "https://", host: "canvas.rice.edu", frecency: 300 },
+    { prefix: "https://", host: "www.youtube.com", frecency: 50 },
+    { prefix: "http://", host: "youtube.com", frecency: 50 },
+    { prefix: "https://", host: "github.githubassets.cdn.com", frecency: 900 },
+    { prefix: "https://", host: "github.com", frecency: 10 },
+    { prefix: "moz-extension://", host: "krillion.io", frecency: 999 },
+    { prefix: "https://", host: "krillionaire.com", frecency: 999 },
+  ];
+  assert.equal(pickHistoryOrigin("krillion", rows), "https://krillion.io");
+  assert.equal(pickHistoryOrigin("canvas", rows), "https://canvas.rice.edu");
+  assert.equal(pickHistoryOrigin("youtube", rows), "https://www.youtube.com");
+  assert.equal(pickHistoryOrigin("github", rows), "https://github.com");
+  assert.equal(pickHistoryOrigin("nope", rows), null);
+  assert.equal(pickHistoryOrigin("krillion", []), null);
 });

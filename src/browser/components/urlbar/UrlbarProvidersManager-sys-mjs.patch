@@ -1,8 +1,33 @@
 diff --git a/browser/components/urlbar/UrlbarProvidersManager.sys.mjs b/browser/components/urlbar/UrlbarProvidersManager.sys.mjs
-index d7b24b171c784276f1e8fa7f4df1ccde89419cf0..976ff8ea51ad39971d5d58a6bfe71069ad4bb4cf 100644
+index d7b24b171c784276f1e8fa7f4df1ccde89419cf0..81b706c289ace9e81c71d342271eb5a03f020e48 100644
 --- a/browser/components/urlbar/UrlbarProvidersManager.sys.mjs
 +++ b/browser/components/urlbar/UrlbarProvidersManager.sys.mjs
-@@ -935,6 +935,7 @@ export class Query {
+@@ -28,6 +28,7 @@ const lazy = XPCOMUtils.declareLazy({
+   UrlbarShared: "chrome://browser/content/urlbar/UrlbarShared.mjs",
+   UrlbarTokenizer:
+     "moz-src:///browser/components/urlbar/UrlbarTokenizer.sys.mjs",
++  ZenUrlbarSpaceTabs: "resource:///modules/ZenUrlbarSpaceTabs.sys.mjs",
+   logger: () => lazy.UrlbarShared.getLogger({ prefix: "ProvidersManager" }),
+ });
+ 
+@@ -928,6 +929,16 @@ export class Query {
+       return;
+     }
+ 
++    // Only offer "Switch to tab" for tabs in this window's current space.
++    result = lazy.ZenUrlbarSpaceTabs.keepTabSwitchInSpace(
++      result,
++      this.controller?.browserWindow,
++      this.context.searchMode
++    );
++    if (!result) {
++      return;
++    }
++
+     // In search mode, don't allow heuristic results in the following cases
+     // since they don't make sense:
+     //   * When the search string is empty, or
+@@ -935,6 +946,7 @@ export class Query {
      if (
        result.heuristic &&
        this.context.searchMode &&
@@ -10,7 +35,7 @@ index d7b24b171c784276f1e8fa7f4df1ccde89419cf0..976ff8ea51ad39971d5d58a6bfe71069
        (!this.context.trimmedSearchString ||
          (!this.context.searchMode.engineName && !result.autofill))
      ) {
-@@ -1092,6 +1093,7 @@ function updateSourcesIfEmpty(context) {
+@@ -1092,6 +1104,7 @@ function updateSourcesIfEmpty(context) {
              lazy.UrlbarShared.TOKEN_TYPE.RESTRICT_TITLE,
              lazy.UrlbarShared.TOKEN_TYPE.RESTRICT_URL,
              lazy.UrlbarShared.TOKEN_TYPE.RESTRICT_ACTION,
@@ -18,7 +43,7 @@ index d7b24b171c784276f1e8fa7f4df1ccde89419cf0..976ff8ea51ad39971d5d58a6bfe71069
            ]).includes(t.type)
          );
  
-@@ -1151,6 +1153,14 @@ function updateSourcesIfEmpty(context) {
+@@ -1151,6 +1164,14 @@ function updateSourcesIfEmpty(context) {
            acceptedSources.push(source);
          }
          break;
