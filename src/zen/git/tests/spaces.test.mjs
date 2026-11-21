@@ -28,7 +28,7 @@ import {
   spaceSnapshot,
 } from "../ZenGitModel.sys.mjs";
 
-function exec(args, cwd) {
+function exec(args, cwd, extraEnv = {}) {
   return new Promise(resolve => {
     execFile(
       "git",
@@ -37,6 +37,7 @@ function exec(args, cwd) {
         cwd,
         env: {
           ...process.env,
+          ...extraEnv,
           GIT_AUTHOR_NAME: "Test",
           GIT_AUTHOR_EMAIL: "test@example.com",
           GIT_COMMITTER_NAME: "Test",
@@ -300,4 +301,42 @@ test("settings keep each space's default branch", () => {
   assert.deepEqual(SETTINGS_CODEC.fromFiles(files), settings);
   assert.equal(SETTINGS_CODEC.fromFiles({}), null);
   assert.equal(SETTINGS_CODEC.fromFiles({ "settings.json": "{oops" }), null);
+});
+
+test("time travel keeps snapshots on a hidden ref, apart from branches", async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "zen-git-time-"));
+  const shared = new ZenGitRepo({ dir: path.join(dir, "layouts"), exec, fs: nodeFs });
+  await shared.ensureInit();
+  await shared.excludeLocally(".spaces/");
+  const school = new ZenGitRepo({
+    dir: path.join(dir, "layouts", ".spaces", "school"),
+    exec,
+    fs: nodeFs,
+    codec: spaceCodec("school"),
+    branchPrefix: spaceBranchPrefix("school"),
+  });
+  await shared.addWorktree(school.dir, school.fullBranch("main"));
+  const ref = "refs/zen/time/school";
+
+  const v1 = spaceOnly("School", [tab("t1", "https://canvas.rice.edu/")]);
+  const v2 = spaceOnly("School", [tab("t1", "https://canvas.rice.edu/"), tab("t2", "https://quizlet.com/")]);
+  assert.ok(await school.snapshotToRef(ref, v1, "snap 1"));
+  assert.equal(await school.snapshotToRef(ref, v1, "same"), null, "unchanged is skipped");
+  assert.ok(await school.snapshotToRef(ref, v2, "snap 2"));
+
+  const timeline = await school.timeline(ref);
+  assert.equal(timeline.length, 2);
+  assert.match(timeline[0].date, /^[A-Z][a-z]{2} [A-Z][a-z]{2} \d{1,2}, \d{1,2}:\d{2} [AP]M$/);
+  const now = await school.snapshotAt(ref, "now");
+  assert.deepEqual(now.snapshot, v2);
+  assert.equal(await school.snapshotAt(ref, "last year"), null);
+
+  // The branch, working tree and branch list are untouched.
+  assert.equal(await school.hasCommits(), false);
+  assert.deepEqual(await school.branches(), []);
+  assert.equal(await nodeFs.exists(path.join(school.dir, "space.json")), false);
+  const leftovers = (await fs.readdir(path.join(dir, "layouts", ".git"))).filter(f => f.startsWith("zen-time-"));
+  assert.deepEqual(leftovers, [], "temporary files are cleaned up");
+
+  await fs.rm(dir, { recursive: true, force: true });
 });

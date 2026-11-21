@@ -998,3 +998,309 @@ export function resolveCdTarget(target) {
   }
   return { kind: "url", url: `https://${host}${path}` };
 }
+
+// ---------------------------------------------------------------------------
+// Time travel, grep, cherry-pick, share and focus helpers
+
+const TIME_WORDS =
+  /\b(now|today|yesterday|tonight|morning|noon|afternoon|evening|night|midnight|ago|last|week|weeks|month|months|day|days|hour|hours|minute|minutes|monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tue|wed|thu|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\b|\d{4}-\d{2}-\d{2}|\b\d{1,2}(:\d{2})?\s*(am|pm)\b/i;
+
+/**
+ * @param {string} text
+ * @returns {boolean} Whether text reads like a moment in time ("yesterday",
+ *   "last tuesday", "3 days ago", "2026-11-18", "9am"), which git's date
+ *   parser understands, rather than a branch or commit.
+ */
+export function looksLikeTime(text) {
+  return TIME_WORDS.test((text || "").trim());
+}
+
+/**
+ * Finds a query in a page's text and returns short snippets around each
+ * match, for `grep`.
+ *
+ * @param {string} text
+ * @param {string} query Plain text, matched case-insensitively.
+ * @param {{max?: number, width?: number}} [options]
+ * @returns {{count: number, snippets: string[]}}
+ */
+export function snippetAround(text, query, { max = 3, width = 70 } = {}) {
+  const result = { count: 0, snippets: [] };
+  if (!text || !query) {
+    return result;
+  }
+  const haystack = text.toLowerCase();
+  const needle = query.toLowerCase();
+  let at = haystack.indexOf(needle);
+  while (at !== -1) {
+    result.count++;
+    if (result.snippets.length < max) {
+      const start = Math.max(0, at - width);
+      const end = Math.min(text.length, at + needle.length + width);
+      let snippet = text.slice(start, end).replace(/\s+/g, " ").trim();
+      if (start > 0) {
+        snippet = "…" + snippet;
+      }
+      if (end < text.length) {
+        snippet += "…";
+      }
+      result.snippets.push(snippet);
+    }
+    at = haystack.indexOf(needle, at + needle.length);
+  }
+  return result;
+}
+
+/**
+ * Picks tabs by 1-based number or by text in their title or URL, for
+ * `cherry-pick`. "all" picks every tab.
+ *
+ * @param {{title: string, url: string}[]} tabs
+ * @param {string[]} selectors
+ * @returns {object[]} The picked tabs, in list order, without duplicates.
+ */
+export function selectTabs(tabs, selectors) {
+  if (selectors.some(s => s.toLowerCase() === "all")) {
+    return [...tabs];
+  }
+  const picked = new Set();
+  for (const selector of selectors) {
+    if (/^\d+$/.test(selector)) {
+      const tab = tabs[Number(selector) - 1];
+      if (tab) {
+        picked.add(tab);
+      }
+      continue;
+    }
+    const needle = selector.toLowerCase();
+    for (const tab of tabs) {
+      if (
+        (tab.title || "").toLowerCase().includes(needle) ||
+        (tab.url || "").toLowerCase().includes(needle)
+      ) {
+        picked.add(tab);
+      }
+    }
+  }
+  return tabs.filter(tab => picked.has(tab));
+}
+
+export const SHARE_FORMAT = "commit-space";
+const SHARE_CODE_PREFIX = "commit-space:";
+
+/**
+ * The portable form of a space for `share`: names, folders and tabs, with
+ * no ids from this computer.
+ *
+ * @param {object} space A space from a snapshot.
+ * @returns {object}
+ */
+export function toSharedSpace(space) {
+  const folderIndex = new Map(space.folders.map((f, i) => [f.id, i]));
+  return {
+    format: SHARE_FORMAT,
+    version: 1,
+    name: space.name,
+    icon: space.icon || null,
+    folders: space.folders.map(f => ({
+      name: f.name,
+      parent: f.parentId && folderIndex.has(f.parentId)
+        ? folderIndex.get(f.parentId)
+        : null,
+    })),
+    tabs: space.tabs.map(t => ({
+      title: t.title,
+      url: t.url,
+      pinned: !!t.pinned,
+      folder: t.folderId && folderIndex.has(t.folderId)
+        ? folderIndex.get(t.folderId)
+        : null,
+    })),
+  };
+}
+
+/**
+ * Turns a shared space back into a one-space snapshot with fresh ids.
+ *
+ * @param {object} shared From toSharedSpace.
+ * @param {{id: string, name: string, icon?: string|null}} live The space it goes into.
+ * @param {string} idPrefix Makes the new tab and folder ids unique.
+ * @returns {object}
+ */
+export function fromSharedSpace(shared, live, idPrefix) {
+  if (shared?.format !== SHARE_FORMAT || !Array.isArray(shared.tabs)) {
+    throw new Error("That isn't a shared Commit space.");
+  }
+  const folderId = i => `${idPrefix}-folder-${i}`;
+  const folders = (shared.folders || []).map((f, i) => ({
+    id: folderId(i),
+    name: String(f.name || "Folder"),
+    parentId: Number.isInteger(f.parent) ? folderId(f.parent) : null,
+  }));
+  const tabs = [];
+  shared.tabs.forEach((t, i) => {
+    const url = sanitizeUrl(String(t.url || ""));
+    if (!url) {
+      return;
+    }
+    const tab = {
+      id: `${idPrefix}-tab-${i}`,
+      title: String(t.title || url),
+      url,
+      pinned: !!t.pinned,
+    };
+    if (Number.isInteger(t.folder) && folders[t.folder]) {
+      tab.folderId = folderId(t.folder);
+    }
+    tabs.push(tab);
+  });
+  return {
+    version: SNAPSHOT_VERSION,
+    essentials: [],
+    spaces: [
+      {
+        id: live.id,
+        name: live.name,
+        icon: live.icon ?? shared.icon ?? null,
+        folders,
+        tabs,
+      },
+    ],
+  };
+}
+
+function toBase64Url(text) {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function fromBase64Url(text) {
+  const base64 = text.replace(/-/g, "+").replace(/_/g, "/");
+  const binary = atob(base64 + "=".repeat((4 - (base64.length % 4)) % 4));
+  return new TextDecoder().decode(
+    Uint8Array.from(binary, char => char.charCodeAt(0))
+  );
+}
+
+/** @returns {string} A paste-able code holding a shared space. */
+export function encodeShareCode(shared) {
+  return SHARE_CODE_PREFIX + toBase64Url(JSON.stringify(shared));
+}
+
+/** @returns {object|null} The shared space in a code, or null. */
+export function decodeShareCode(code) {
+  const text = (code || "").trim();
+  if (!text.startsWith(SHARE_CODE_PREFIX)) {
+    return null;
+  }
+  try {
+    return JSON.parse(fromBase64Url(text.slice(SHARE_CODE_PREFIX.length)));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * @param {string} text e.g. "25m", "1h", "1h30m", "90" (minutes).
+ * @returns {number} Milliseconds, or 0 if it isn't a duration.
+ */
+export function parseDuration(text) {
+  const value = (text || "").trim().toLowerCase();
+  if (/^\d+$/.test(value)) {
+    return Number(value) * 60000;
+  }
+  const match = /^(?:(\d+)\s*h(?:ours?|rs?)?)?\s*(?:(\d+)\s*m(?:in(?:utes?)?)?)?$/.exec(
+    value
+  );
+  if (!match || (!match[1] && !match[2])) {
+    return 0;
+  }
+  return (Number(match[1] || 0) * 60 + Number(match[2] || 0)) * 60000;
+}
+
+/**
+ * @param {number} ms
+ * @returns {string} "24:05" under an hour, else "1h 05m".
+ */
+export function formatCountdown(ms) {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  const pad = n => String(n).padStart(2, "0");
+  return hours ? `${hours}h ${pad(minutes)}m` : `${minutes}:${pad(seconds)}`;
+}
+
+/**
+ * Focus mode's blocklist: each site also covers its subdomains.
+ *
+ * @param {string[]} sites e.g. ["youtube.com", "reddit.com"]
+ * @returns {RegExp[]}
+ */
+export function focusRules(sites) {
+  return parseIgnore(
+    sites
+      .map(site => site.trim().toLowerCase().replace(/^[a-z]+:\/\//, "").replace(/\/.*$/, ""))
+      .filter(Boolean)
+      .map(site => (site.startsWith("*.") ? site : `*.${site.replace(/^www\./, "")}`))
+      .join("\n")
+  );
+}
+
+// ---------------------------------------------------------------------------
+// top: memory and CPU by process (each site gets its own process)
+
+/**
+ * @param {number} bytes
+ * @returns {string} e.g. "412 MB", "1.3 GB".
+ */
+export function formatBytes(bytes) {
+  const mb = bytes / (1024 * 1024);
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+}
+
+/**
+ * Turns two ChromeUtils.requestProcInfo() samples into rows for `top`.
+ * Web processes are listed with the tabs running in them; the browser
+ * itself, the GPU and helper processes are summed into one "Commit" row.
+ *
+ * @param {object} before First sample (ParentProcInfoDictionary).
+ * @param {object} after Second sample, taken elapsedMs later.
+ * @param {number} elapsedMs
+ * @param {Map<number, object[]>} tabsByPid Live tabs by content process.
+ * @param {{sortBy?: "memory"|"cpu"}} [options]
+ * @returns {{rows: {pid: number|null, memory: number, cpu: number, tabs: object[], label: string}[], total: number}}
+ */
+export function processRows(before, after, elapsedMs, tabsByPid, { sortBy = "memory" } = {}) {
+  const earlier = new Map();
+  for (const proc of [before, ...(before?.children || [])]) {
+    earlier.set(proc.pid, proc.cpuTime || 0);
+  }
+  // cpuTime is in nanoseconds.
+  const cpuOf = proc =>
+    earlier.has(proc.pid) && elapsedMs > 0
+      ? Math.max(0, ((proc.cpuTime || 0) - earlier.get(proc.pid)) / (elapsedMs * 1e6)) * 100
+      : 0;
+
+  const own = { pid: null, memory: after.memory || 0, cpu: cpuOf(after), tabs: [], label: "Commit itself (browser, graphics, helpers)" };
+  const rows = [];
+  let total = after.memory || 0;
+  for (const proc of after.children || []) {
+    total += proc.memory || 0;
+    const tabs = tabsByPid.get(proc.pid) || [];
+    if (!tabs.length) {
+      own.memory += proc.memory || 0;
+      own.cpu += cpuOf(proc);
+      continue;
+    }
+    rows.push({ pid: proc.pid, memory: proc.memory || 0, cpu: cpuOf(proc), tabs, label: "" });
+  }
+  const key = sortBy === "cpu" ? "cpu" : "memory";
+  rows.sort((a, b) => b[key] - a[key]);
+  rows.push(own);
+  return { rows, total };
+}

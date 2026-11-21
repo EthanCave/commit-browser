@@ -207,6 +207,11 @@
     display: none;
   }
 
+  /* Spotify / Music app cards: the app has its own volume. */
+  &[native] .zen-media-mute-button {
+    display: none;
+  }
+
   &:not([can-pip]) {
     .zen-media-info-vbox {
       width: calc(100% - var(--zen-size-26));

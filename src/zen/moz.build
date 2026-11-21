@@ -8,7 +8,9 @@ EXTRA_PP_COMPONENTS += [
 
 DIRS += [
     "adblock",
+    "ai",
     "archive",
+    "focus",
     "boosts",
     "common",
     "compact-mode",

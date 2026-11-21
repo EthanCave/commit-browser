@@ -5,6 +5,7 @@
 - name: media.videocontrols.picture-in-picture.video-toggle.enabled
   value: true
 
-# TODO: Enable once we have a proper settings page
+# Commit: like Arc, a playing video pops out into picture-in-picture when you
+# switch to another tab.
 - name: media.videocontrols.picture-in-picture.enable-when-switching-tabs.enabled
-  value: false
+  value: true

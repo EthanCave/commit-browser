@@ -134,3 +134,13 @@
 .zen-git-console-input::placeholder {
   color: #484f58;
 }
+
+/* grep results jump to their tab when clicked */
+.zen-git-line.clickable {
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.zen-git-line.clickable:hover {
+  background-color: color-mix(in srgb, currentColor 10%, transparent);
+}

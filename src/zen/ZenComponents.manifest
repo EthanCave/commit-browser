@@ -22,3 +22,5 @@ category app-startup nsBrowserGlue @mozilla.org/browser/browserglue;1 applicatio
 #include archive/ArchiveComponents.manifest
 #include sitefixes/SiteFixesComponents.manifest
 #include adblock/AdBlockComponents.manifest
+#include focus/FocusComponents.manifest
+#include ai/AIComponents.manifest

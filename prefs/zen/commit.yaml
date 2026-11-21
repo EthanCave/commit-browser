@@ -25,3 +25,61 @@
 # goes away after 1.5 s instead of 3.
 - name: full-screen-api.warning.timeout
   value: 1500
+
+# Focus mode's default blocklist (`focus 25m` in the console). Each site
+# also covers its subdomains.
+- name: zen.focus.blocklist
+  value: "youtube.com, instagram.com, reddit.com, netflix.com, x.com, tiktok.com, twitch.tv, facebook.com"
+
+# Time travel: snapshot every space this often while Commit is open.
+- name: zen.git.time-travel.enabled
+  value: true
+
+- name: zen.git.time-travel.interval-minutes
+  value: 60
+
+# Spotify and Music (the Mac apps) in the sidebar media bar and the console.
+- name: zen.media.native-players.enabled
+  value: true
+
+# Which app `play` uses when neither is playing: "music", "spotify" or "" (Spotify if installed).
+- name: zen.media.native-players.preferred
+  value: "music"
+
+# AI features (console: ai, ask, tidy, do, catchup; commit messages).
+# Nothing is sent until an API key is added with `ai key`.
+# Fast model: commit messages, catch-up, tidy, ai! filters.
+- name: zen.ai.model.fast
+  value: "claude-haiku-5-5"
+
+# Smart model: ask, do, tidy -s.
+- name: zen.ai.model.smart
+  value: "claude-sonnet-5-5"
+
+# Local search (ai filters, checkout "<description>") with EmbeddingGemma
+# through Ollama, on this Mac. Falls back to Claude when unavailable.
+- name: zen.ai.local.enabled
+  value: true
+
+- name: zen.ai.local.model
+  value: "embeddinggemma"
+
+# `commit` with no -m asks Claude for a message (sends tab titles and URLs).
+- name: zen.ai.commit-messages
+  value: true
+
+# The catch-up card when you come back to a space after this many hours.
+- name: zen.ai.catch-up.enabled
+  value: true
+
+- name: zen.ai.catch-up.after-hours
+  value: 12
+
+# How much page text `ask` sends at most (about 4 characters per token).
+- name: zen.ai.ask.max-chars
+  value: 120000
+
+# Where `do` searches: "auto" (Tavily if the tvly CLI is signed in, else
+# Claude's web search), "tavily", or "anthropic".
+- name: zen.ai.do.search
+  value: "auto"

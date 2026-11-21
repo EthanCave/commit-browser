@@ -39,7 +39,7 @@ Every space in my browser has its own history here.
  * Process and file access are injected so this class runs both inside the
  * browser (Subprocess + IOUtils) and under Node for tests.
  *
- * exec(args, cwd) => Promise<{exitCode: number, output: string}>
+ * exec(args, cwd, env?) => Promise<{exitCode: number, output: string}>
  * fs: { join(...parts), exists(path), read(path), write(path, text),
  *       remove(path), mkdir(path), list(dir) => Promise<string[]> (names) }
  *
@@ -119,6 +119,21 @@ export class ZenGitRepo {
    */
   async tryGit(...args) {
     return this.#exec(args, this.#dir);
+  }
+
+  /**
+   * Like git(), with extra environment variables (e.g. GIT_INDEX_FILE).
+   *
+   * @param {object} env
+   * @param {...string} args
+   * @returns {Promise<string>}
+   */
+  async gitWithEnv(env, ...args) {
+    const { exitCode, output } = await this.#exec(args, this.#dir, env);
+    if (exitCode !== 0) {
+      throw new GitError(args, exitCode, output);
+    }
+    return output;
   }
 
   async isRepo() {
@@ -399,6 +414,122 @@ export class ZenGitRepo {
       })
       .filter(entry => entry.ours)
       .map(({ ours, ...entry }) => entry);
+  }
+
+  // -------------------------------------------------------------------------
+  // Time travel: snapshots kept on a hidden ref (refs/zen/time/...), outside
+  // refs/heads so they never show up as branches or get pushed.
+
+  /**
+   * Records a snapshot as a new commit on `ref`, without touching the
+   * checked-out branch or working tree. Skipped when nothing changed.
+   *
+   * @param {string} ref e.g. "refs/zen/time/rice"
+   * @param {object} snapshot
+   * @param {string} message
+   * @returns {Promise<string|null>} The new commit, or null if unchanged.
+   */
+  async snapshotToRef(ref, snapshot, message) {
+    let common = (await this.git("rev-parse", "--git-common-dir")).trim();
+    if (!common.startsWith("/")) {
+      common = this.#fs.join(this.#dir, common);
+    }
+    const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const index = this.#fs.join(common, `zen-time-index-${stamp}`);
+    const env = { GIT_INDEX_FILE: index };
+    const temps = [index];
+    try {
+      await this.gitWithEnv(env, "read-tree", "--empty");
+      for (const [path, text] of Object.entries(this.#codec.toFiles(snapshot))) {
+        const file = this.#fs.join(common, `zen-time-blob-${stamp}`);
+        temps.push(file);
+        await this.#fs.write(file, text);
+        const blob = (await this.git("hash-object", "-w", file)).trim();
+        await this.gitWithEnv(
+          env,
+          "update-index",
+          "--add",
+          "--cacheinfo",
+          `100644,${blob},${path}`
+        );
+      }
+      const tree = (await this.gitWithEnv(env, "write-tree")).trim();
+      const parent = await this.tryGit("rev-parse", "-q", "--verify", `${ref}^{commit}`);
+      const parentHash = parent.exitCode === 0 ? parent.output.trim() : null;
+      if (parentHash) {
+        const parentTree = (await this.git("rev-parse", `${parentHash}^{tree}`)).trim();
+        if (parentTree === tree) {
+          return null;
+        }
+      }
+      const commit = (
+        await this.git(
+          "commit-tree",
+          tree,
+          ...(parentHash ? ["-p", parentHash] : []),
+          "-m",
+          message
+        )
+      ).trim();
+      await this.git("update-ref", ref, commit);
+      return commit;
+    } finally {
+      for (const file of temps) {
+        await this.#fs.remove(file);
+      }
+    }
+  }
+
+  /**
+   * The newest snapshot on `ref` taken at or before `when`, in any form
+   * git's date parser understands ("yesterday", "last tuesday 5pm",
+   * "3 days ago", "2026-11-18").
+   *
+   * @param {string} ref
+   * @param {string} when
+   * @returns {Promise<{hash: string, date: string, snapshot: object}|null>}
+   */
+  async snapshotAt(ref, when) {
+    const found = await this.tryGit(
+      "log",
+      "-1",
+      `--before=${when}`,
+      "--format=%H%x1f%cd",
+      "--date=format:%a %b %-d, %-I:%M %p",
+      ref,
+      "--"
+    );
+    const [hash, date] = found.output.trim().split("\x1f");
+    if (found.exitCode !== 0 || !hash) {
+      return null;
+    }
+    return { hash, date, snapshot: await this.readSnapshot(hash) };
+  }
+
+  /**
+   * @param {string} ref
+   * @param {number} [count]
+   * @returns {Promise<{hash: string, date: string, ago: string}[]>} Newest first.
+   */
+  async timeline(ref, count = 30) {
+    const result = await this.tryGit(
+      "log",
+      `-n${count}`,
+      "--format=%h%x1f%cd%x1f%cr",
+      "--date=format:%a %b %-d, %-I:%M %p",
+      ref,
+      "--"
+    );
+    if (result.exitCode !== 0) {
+      return [];
+    }
+    return result.output
+      .split("\n")
+      .filter(Boolean)
+      .map(line => {
+        const [hash, date, ago] = line.split("\x1f");
+        return { hash, date, ago };
+      });
   }
 
   // -------------------------------------------------------------------------

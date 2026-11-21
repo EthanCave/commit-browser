@@ -6,8 +6,15 @@ import { ZenUIComponent } from "resource:///modules/zen/ui/ZenUIComponent.sys.mj
 import { STATUS_CHANGED_TOPIC, ZenGitManager } from "./ZenGitManager.sys.mjs";
 import {
   STATUS,
+  decodeShareCode,
+  encodeShareCode,
+  formatBytes,
+  processRows,
   extractMessage,
   isClean,
+  looksLikeTime,
+  parseDuration,
+  selectTabs,
   formatDiff,
   formatStatus,
   pickHistoryOrigin,
@@ -15,16 +22,76 @@ import {
   summarize,
   tokenize,
 } from "./ZenGitModel.sys.mjs";
+import {
+  PIPE_ACTIONS,
+  applyFilter,
+  checkPipeline,
+  formatItem,
+  historyRange,
+  isPipeline,
+  splitPipeline,
+} from "./ZenPipes.sys.mjs";
 
 const lazy = {};
 ChromeUtils.defineESModuleGetters(lazy, {
   ZenTabArchiver: "resource:///modules/zen/archive/ZenTabArchiver.sys.mjs",
+  ZenFocus: "resource:///modules/zen/focus/ZenFocus.sys.mjs",
+  SessionStore:
+    "moz-src:///browser/components/sessionstore/SessionStore.sys.mjs",
   formatAge: "resource:///modules/zen/archive/ZenTabArchiveModel.sys.mjs",
   SearchService: "moz-src:///toolkit/components/search/SearchService.sys.mjs",
   PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
+  ZenNativePlayers: "resource:///modules/zen/media/ZenNativePlayers.sys.mjs",
+  describeTrack: "resource:///modules/zen/media/ZenNativePlayersModel.sys.mjs",
+  searchURL: "resource:///modules/zen/media/ZenNativePlayersModel.sys.mjs",
+  PLAYERS: "resource:///modules/zen/media/ZenNativePlayersModel.sys.mjs",
+  ZenAI: "resource:///modules/zen/ai/ZenAI.sys.mjs",
+  ZenAIWindow: "resource:///modules/zen/ai/ZenAIWindow.sys.mjs",
+  ZenEmbeddings: "resource:///modules/zen/ai/ZenEmbeddings.sys.mjs",
+  ZenDo: "resource:///modules/zen/ai/ZenDo.sys.mjs",
 });
+ChromeUtils.defineLazyGetter(lazy, "AIModel", () =>
+  ChromeUtils.importESModule("resource:///modules/zen/ai/ZenAIModel.sys.mjs")
+);
 
 const HTML_NS = "http://www.w3.org/1999/xhtml";
+
+// `ai key sk-ant-…` never shows up in the console output or its history.
+function hideSecrets(line) {
+  return line.replace(/^(\s*ai\s+key\s+)(?!-)\S+/, "$1••••••••");
+}
+const BLAME_KEY = "zen-blame";
+
+function registerGrepActor() {
+  try {
+    ChromeUtils.registerWindowActor("ZenGrep", {
+      parent: { esModuleURI: "resource:///modules/zen/git/ZenGrepParent.sys.mjs" },
+      child: { esModuleURI: "resource:///modules/zen/git/ZenGrepChild.sys.mjs" },
+      allFrames: false,
+      messageManagerGroups: ["browsers"],
+    });
+  } catch (e) {
+    if (e.name !== "NotSupportedError") {
+      console.error(e);
+    }
+    /* already registered by another window */
+  }
+}
+
+function relativeTime(at) {
+  const minutes = Math.round((Date.now() - at) / 60000);
+  if (minutes < 1) {
+    return "just now";
+  }
+  if (minutes < 60) {
+    return `${minutes} min ago`;
+  }
+  const hours = Math.round(minutes / 60);
+  if (hours < 48) {
+    return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  }
+  return `${Math.round(hours / 24)} days ago`;
+}
 const MAX_OUTPUT_LINES = 500;
 
 // Tab events that can change a tab's status.
@@ -90,6 +157,63 @@ const HELP = [
     "archive [now|on|off|after <hours>]",
     "auto-archive: see which old tabs will close, or close them now",
   ],
+  ["", "Time travel (a snapshot of every space each hour):"],
+  ["timeline", "this space's snapshots"],
+  [
+    "checkout <time>",
+    "bring back this space as it was: yesterday, \"last tuesday\", \"3 days ago\"",
+  ],
+  ["diff <time>", "what you opened and closed since then"],
+  ["", "Finding and moving tabs:"],
+  ["grep [-a] <text>", "search the text of this space's tabs (-a: every space)"],
+  ["go <n>", "jump to a result from grep (or click it)"],
+  ["blame", "where this tab came from and when it was first committed"],
+  [
+    "cherry-pick <from> [n|text]",
+    "copy tabs here from a branch, another space, <space>/<branch> or a time",
+  ],
+  ["share [-y | --code]", "share this space: preview, secret gist (-y) or a code"],
+  ["import <link|code>", "add a space someone shared"],
+  ["focus [25m] [sites]", "block distracting sites and stay in this space (focus off ends it)"],
+  ["", "Speed:"],
+  ["top [-c]", "memory and CPU by site (-c: busiest first)"],
+  ["unload <n>", "put the tabs in one row of `top` to sleep"],
+  ["gc", "put every background tab to sleep (they reload when you click them)"],
+  ["", "Music (the Spotify and Music apps):"],
+  ["np", "what's playing, in the apps and in tabs"],
+  [
+    "play [spotify|music] [song]",
+    "play, or find a song: Music plays it from your library, Spotify opens its search",
+  ],
+  ["pause / next / prev", "pause, skip, previous track"],
+  ["", "AI (Claude; needs an Anthropic API key: `ai key`):"],
+  ["ai", "key, models, local search and what this session has cost"],
+  ['… | ai "<description>"', "filter by meaning, on this Mac: ls -a | ai \"about my thesis\" | mv School"],
+  ['… | ai! "<description>"', "the same filter by Claude, which knows more (Hikaru → chess)"],
+  ["ask [-a] <question>", "answer from the pages open in this space (-a: every space)"],
+  ["tidy [-s] / tidy apply", "propose folders, moves and closes (-s: smarter model); apply does it"],
+  ["catchup", "what you were doing in this space (also shown after time away)"],
+  ["do <task> / do open", "research on the web (Tavily if signed in) and report back; open the sources"],
+  ["ai location <city>", "where you are, for \"near me\" in do (only this text is sent)"],
+  ["commit", "with no -m, Claude writes the message from what changed"],
+  ['checkout "<description>"', "find a commit by meaning: checkout \"planning Tokyo\""],
+  ["", "Pipes (start with a list, filter it, end with an action):"],
+  ["ls [-a] | …", "tabs in this space (-a: every space)"],
+  ["history [today|yesterday|week|3d|all] [text]", ""],
+  ["", "                         pages you visited (`history` alone: commands you typed here)"],
+  ["| grep [-v] [-u] <text>", "keep matches in the title or URL (-v: drop them, -u: URL only)"],
+  ["| head / tail [n]", "first / last n (10)"],
+  ["| sort [-r] [title|url|host|space|time]", ""],
+  ["| uniq", "drop repeated URLs"],
+  [
+    "| close / sleep / mv <space>",
+    "close tabs, put them to sleep, or move them to a space",
+  ],
+  ["| open / copy / wc", "open as tabs, copy the URLs, or count"],
+  [
+    "",
+    "e.g. ls -a | grep youtube | close   ·   history today | grep recipe | open",
+  ],
   ["clear / history / help", ""],
 ];
 
@@ -102,6 +226,11 @@ export class ZenGitConsole extends ZenUIComponent {
   #previousTab = null;
   #currentTab = null;
   #observer = () => this.#applyDots();
+  #startedAt = 0;
+  #consoleOpening = null;
+  #grepResults = [];
+  #topRows = [];
+  #grepQuery = "";
 
   init() {
     this.addEventListener("keydown", { capture: true });
@@ -112,7 +241,10 @@ export class ZenGitConsole extends ZenUIComponent {
     this.listenBrowserTabsProgress();
     Services.obs.addObserver(this.#observer, STATUS_CHANGED_TOPIC);
     this.#currentTab = this.window.gBrowser.selectedTab;
+    this.#startedAt = Date.now();
     ZenGitManager.scheduleRefresh(this.window);
+    ZenGitManager.startTimeTravel();
+    registerGrepActor();
   }
 
   uninit() {
@@ -120,6 +252,9 @@ export class ZenGitConsole extends ZenUIComponent {
   }
 
   handleEvent(event) {
+    if (event.type === "TabOpen") {
+      this.#recordOrigin(event.target);
+    }
     if (TAB_EVENTS.includes(event.type)) {
       ZenGitManager.scheduleRefresh(this.window);
       return;
@@ -240,7 +375,7 @@ export class ZenGitConsole extends ZenUIComponent {
         this.#input.value = "";
         this.#historyIndex = -1;
         if (line.trim()) {
-          this.#history.unshift(line);
+          this.#history.unshift(hideSecrets(line));
         }
         this.run(line).catch(e => this.#print(e.message || String(e), "error"));
         break;
@@ -281,7 +416,7 @@ export class ZenGitConsole extends ZenUIComponent {
     event.preventDefault();
   }
 
-  #print(text, kind = "") {
+  #print(text, kind = "", onClick = null) {
     if (!this.#output) {
       return;
     }
@@ -289,12 +424,37 @@ export class ZenGitConsole extends ZenUIComponent {
       const node = this.document.createElementNS(HTML_NS, "div");
       node.className = `zen-git-line ${kind}`;
       node.textContent = line;
+      if (onClick) {
+        node.classList.add("clickable");
+        node.addEventListener("click", onClick);
+      }
       this.#output.append(node);
     }
     while (this.#output.childElementCount > MAX_OUTPUT_LINES) {
       this.#output.firstElementChild.remove();
     }
     this.#output.scrollTop = this.#output.scrollHeight;
+  }
+
+  // A line of Claude's answer: `**bold**` shows as bold instead of asterisks.
+  #fillRich(node, text) {
+    node.replaceChildren(
+      ...lazy.AIModel.inlineSegments(text).map(({ text: part, bold }) => {
+        if (!bold) {
+          return this.document.createTextNode(part);
+        }
+        const strong = this.document.createElementNS(HTML_NS, "b");
+        strong.textContent = part;
+        return strong;
+      })
+    );
+  }
+
+  #printRich(text, kind = "") {
+    for (const line of String(text).split("\n")) {
+      this.#print(line, kind);
+      this.#fillRich(this.#output.lastElementChild, line);
+    }
   }
 
   #printStatusLines(lines) {
@@ -315,7 +475,11 @@ export class ZenGitConsole extends ZenUIComponent {
   // Commands
 
   async run(line) {
-    this.#print(`❯ ${line}`, "echo");
+    this.#print(`❯ ${hideSecrets(line)}`, "echo");
+    if (isPipeline(line)) {
+      await this.#pipe(line);
+      return;
+    }
     const [name, ...args] = tokenize(line);
     if (!name) {
       return;
@@ -354,15 +518,41 @@ export class ZenGitConsole extends ZenUIComponent {
       essentials: this.#essentials,
       default: this.#default,
       clone: this.#clone,
+      timeline: this.#timeline,
+      grep: this.#grep,
+      go: this.#go,
+      blame: this.#blame,
+      "cherry-pick": this.#cherryPick,
+      share: this.#share,
+      import: this.#import,
+      focus: this.#focus,
+      top: this.#top,
+      unload: this.#unload,
+      gc: this.#gc,
+      ai: this.#ai,
+      ask: this.#ask,
+      tidy: this.#tidy,
+      catchup: this.#catchUp,
+      do: this.#do,
+      np: this.#nowPlaying,
+      play: this.#play,
+      pause: this.#pause,
+      next: args => this.#skip("next", args),
+      skip: args => this.#skip("next", args),
+      prev: args => this.#skip("previous", args),
       setup: this.#clone,
       archive: this.#archive,
       debug: this.#debug,
       clear: () => this.#output.replaceChildren(),
-      history: () =>
-        this.#print(
-          this.#history.slice(1).reverse().join("\n") || "(empty)",
-          "dim"
-        ),
+      // `history` alone is what you typed here; `history today` (or
+      // yesterday, week, 3d, all) is the pages you visited.
+      history: (args, line) =>
+        args.length
+          ? this.#pipe(line)
+          : this.#print(
+              this.#history.slice(1).reverse().join("\n") || "(empty)",
+              "dim"
+            ),
     };
   }
 
@@ -408,7 +598,7 @@ export class ZenGitConsole extends ZenUIComponent {
         if (resolved.guess) {
           url = (await this.#fromHistory(resolved.guess)) || url;
         }
-        this.window.openTrustedLinkIn(url, where);
+        this.#openFromConsole(url, where, `${where === "tab" ? "open" : "cd"} ${target}`);
       }
     }
   }
@@ -445,7 +635,16 @@ export class ZenGitConsole extends ZenUIComponent {
   async #searchFor(query, where) {
     const engine = await lazy.SearchService.getDefault();
     const url = engine.getSubmission(query).uri.spec;
-    this.window.openTrustedLinkIn(url, where);
+    this.#openFromConsole(url, where, `search "${query}"`);
+  }
+
+  #openFromConsole(url, where, label) {
+    this.#consoleOpening = label;
+    try {
+      this.window.openTrustedLinkIn(url, where);
+    } finally {
+      this.window.setTimeout(() => (this.#consoleOpening = null), 0);
+    }
   }
 
   async #cd(args) {
@@ -571,7 +770,17 @@ export class ZenGitConsole extends ZenUIComponent {
     this.#printStatusLines(formatStatus(essentials.status, true));
   }
 
-  async #diff() {
+  async #diff(args = []) {
+    if (args.length) {
+      const when = args.join(" ");
+      const { status, date, space } = await ZenGitManager.diffSince(
+        this.window,
+        when
+      );
+      this.#print(`${space.name} since ${date}:`, "dim");
+      this.#printStatusLines(formatDiff(status));
+      return;
+    }
     const { status } = await ZenGitManager.spaceStatus(this.window);
     this.#printStatusLines(formatDiff(status));
   }
@@ -589,8 +798,12 @@ export class ZenGitConsole extends ZenUIComponent {
       return;
     }
     if (!message) {
-      const { status } = await ZenGitManager.spaceStatus(this.window);
+      const { status, space } = await ZenGitManager.spaceStatus(this.window);
       message = `Layout: ${summarize(status)}`;
+      const written = await this.#writeCommitMessage(space, status);
+      if (written) {
+        message = written;
+      }
     }
     const { hash, essentialsHash, branch, space } = await ZenGitManager.commit(
       this.window,
@@ -789,6 +1002,1304 @@ export class ZenGitConsole extends ZenUIComponent {
     );
   }
 
+  // ---------------------------------------------------------------------
+  // Time travel, grep, blame, cherry-pick, share, focus
+
+  async #timeline() {
+    const { space, entries } = await ZenGitManager.timeline(this.window);
+    if (!entries.length) {
+      this.#print(
+        `${space.name} has no snapshots yet. One is taken every hour while Commit is open.`,
+        "dim"
+      );
+      return;
+    }
+    this.#print(`${space.name}, newest first:`, "dim");
+    for (const { date, ago } of entries) {
+      this.#print(`  ${date.padEnd(22)} ${ago}`);
+    }
+    this.#print('`checkout "<time>"` brings one back, `diff <time>` compares.', "dim");
+  }
+
+  async #grep(args) {
+    const all = args.includes("-a") || args.includes("--all");
+    const query = args.filter(a => a !== "-a" && a !== "--all").join(" ");
+    if (!query) {
+      this.#print("usage: grep [-a] <text>", "error");
+      return;
+    }
+    const { gZenWorkspaces } = this.window;
+    const active = gZenWorkspaces.activeWorkspace;
+    const spaces = new Map(gZenWorkspaces.getWorkspaces().map(s => [s.uuid, s.name]));
+    const tabs = gZenWorkspaces.allStoredTabs.filter(
+      tab =>
+        !tab.hasAttribute("zen-empty-tab") &&
+        !tab.hasAttribute("zen-glance-tab") &&
+        (all ||
+          tab.hasAttribute("zen-essential") ||
+          tab.getAttribute("zen-workspace-id") === active)
+    );
+    const needle = query.toLowerCase();
+    let unloaded = 0;
+    const found = await Promise.all(
+      tabs.map(async tab => {
+        const url = tab.linkedBrowser?.currentURI?.spec || "";
+        const inTitle =
+          tab.label.toLowerCase().includes(needle) || url.toLowerCase().includes(needle);
+        let page = { count: 0, snippets: [] };
+        const actor = tab.linkedBrowser?.browsingContext?.currentWindowGlobal;
+        if (actor && !tab.hasAttribute("pending")) {
+          try {
+            page = await Promise.race([
+              actor.getActor("ZenGrep").sendQuery("ZenGrep:Search", { query, max: 2 }),
+              new Promise(resolve => this.window.setTimeout(() => resolve(page), 2500)),
+            ]);
+          } catch {
+            /* about: pages and the like can't be searched */
+          }
+        } else {
+          unloaded++;
+        }
+        return inTitle || page?.count ? { tab, inTitle, page } : null;
+      })
+    );
+    this.#grepResults = found.filter(Boolean).map(r => r.tab);
+    this.#grepQuery = query;
+    if (!this.#grepResults.length) {
+      this.#print(`No tabs mention "${query}".`, "dim");
+    }
+    found.filter(Boolean).forEach(({ tab, page }, i) => {
+      let host = "";
+      try {
+        host = tab.linkedBrowser.currentURI.host;
+      } catch {}
+      const where = all
+        ? `  [${tab.hasAttribute("zen-essential") ? "essentials" : spaces.get(tab.getAttribute("zen-workspace-id")) || ""}]`
+        : "";
+      const count = page?.count ? `  (${page.count})` : "";
+      const go = () => this.#go([String(i + 1)]);
+      this.#print(`${String(i + 1).padStart(2)}  ${tab.label}${host ? ` — ${host}` : ""}${count}${where}`, "added", go);
+      for (const snippet of page?.snippets || []) {
+        this.#print(`      ${snippet}`, "dim", go);
+      }
+    });
+    if (unloaded) {
+      this.#print(
+        `(${unloaded} tab${unloaded === 1 ? " isn't" : "s aren't"} loaded, so only ${unloaded === 1 ? "its" : "their"} titles and URLs were searched.)`,
+        "dim"
+      );
+    }
+    if (this.#grepResults.length) {
+      this.#print("`go <n>` or click a result to jump there.", "dim");
+    }
+  }
+
+  async #go(args) {
+    const n = Number.parseInt(args[0], 10);
+    const tab = this.#grepResults[n - 1];
+    if (!tab?.isConnected) {
+      this.#print("usage: go <n>, with a number from the last `grep`", "error");
+      return;
+    }
+    this.window.gBrowser.selectedTab = tab;
+    this.toggle(false);
+    if (!this.#grepQuery) {
+      return;
+    }
+    try {
+      const findbar = await this.window.gBrowser.getFindBar(tab);
+      findbar._findField.value = this.#grepQuery;
+      findbar.open();
+      findbar.onFindAgainCommand(false);
+    } catch {
+      /* the tab is shown even if highlighting fails */
+    }
+  }
+
+  // Remembers where a new tab came from, for `blame`. Saved with the tab, so
+  // it survives restarts; tabs restored at startup keep what they had.
+  #recordOrigin(tab) {
+    if (Date.now() - this.#startedAt < 15000 || tab.hasAttribute("pending")) {
+      return;
+    }
+    const consoleLabel = this.#consoleOpening;
+    this.window.setTimeout(async () => {
+      try {
+        if (!tab.isConnected || lazy.SessionStore.getCustomTabValue(tab, BLAME_KEY)) {
+          return;
+        }
+        const opener = tab.openerTab;
+        const space = this.window.gZenWorkspaces.getActiveWorkspaceFromCache();
+        let branch = null;
+        try {
+          branch = await (await ZenGitManager.activeSpaceRepo(this.window)).repo.currentBranch();
+        } catch {}
+        const record = {
+          at: Date.now(),
+          how: consoleLabel ? "console" : opener ? "link" : "new tab",
+          command: consoleLabel,
+          from: opener
+            ? { title: opener.label, url: opener.linkedBrowser?.currentURI?.spec || "" }
+            : null,
+          space: space?.name || null,
+          branch: branch || "main",
+        };
+        lazy.SessionStore.setCustomTabValue(tab, BLAME_KEY, JSON.stringify(record));
+      } catch (e) {
+        console.error(e);
+      }
+    }, 0);
+  }
+
+  async #blame() {
+    const tab = this.window.gBrowser.selectedTab;
+    let host = "";
+    try {
+      host = tab.linkedBrowser.currentURI.host;
+    } catch {}
+    this.#print(`${tab.label}${host ? ` — ${host}` : ""}`, "added");
+    let record = null;
+    try {
+      record = JSON.parse(lazy.SessionStore.getCustomTabValue(tab, BLAME_KEY) || "null");
+    } catch {}
+    const line = (label, text) => this.#print(`  ${label.padEnd(9)}${text}`);
+    if (record) {
+      const when = new Date(record.at);
+      line(
+        "opened",
+        `${when.toLocaleString([], { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })} (${relativeTime(record.at)})`
+      );
+      let from = "a new tab";
+      if (record.how === "link" && record.from) {
+        let fromHost = "";
+        try {
+          fromHost = new URL(record.from.url).host;
+        } catch {}
+        from = `a link on "${record.from.title}"${fromHost ? ` (${fromHost})` : ""}`;
+      } else if (record.how === "console") {
+        from = `the console: ${record.command}`;
+      }
+      line("from", from);
+      if (record.space) {
+        line("in", `${record.space} on branch ${record.branch}`);
+      }
+    } else {
+      line("opened", "before Commit started keeping track (tabs opened from now on are)");
+    }
+    try {
+      const state = JSON.parse(lazy.SessionStore.getTabState(tab));
+      const entries = state.entries || [];
+      if (entries.length > 1) {
+        line("started", `${entries[0].url}  (${entries.length} pages back, now on ${state.index || entries.length})`);
+      }
+    } catch {}
+    const first = await ZenGitManager.firstCommitOf(this.window, tab);
+    line(
+      "commit",
+      first
+        ? `first saved in ${first.hash} "${first.subject}" (${first.ago}, on ${first.branch})`
+        : "not in any commit yet"
+    );
+  }
+
+  async #cherryPick(args) {
+    const [source, ...selectors] = args;
+    if (!source) {
+      this.#print(
+        "usage: cherry-pick <branch | space | space/branch | time> [n | text | all]",
+        "error"
+      );
+      return;
+    }
+    const { label, tabs } = await ZenGitManager.pickSource(this.window, source);
+    if (!selectors.length) {
+      if (!tabs.length) {
+        this.#print(`${label} has no tabs.`, "dim");
+        return;
+      }
+      this.#print(`${label}:`, "dim");
+      tabs.forEach((tab, i) => this.#print(`${String(i + 1).padStart(2)}  ${tab.title}`));
+      this.#print(`\`cherry-pick ${source} 2 4\`, \`… <text>\` or \`… all\` copies them here.`, "dim");
+      return;
+    }
+    const picked = selectTabs(tabs, selectors);
+    if (!picked.length) {
+      this.#print(`Nothing in ${label} matches ${selectors.join(" ")}.`, "error");
+      return;
+    }
+    const { opened, skipped } = await ZenGitManager.cherryPick(this.window, picked);
+    for (const tab of opened) {
+      this.#print(`+ ${tab.title}`, "added");
+    }
+    for (const tab of skipped) {
+      this.#print(`  ${tab.title} (already open here)`, "dim");
+    }
+  }
+
+  async #share(args) {
+    const { space, shared } = await ZenGitManager.sharedSpace(this.window);
+    if (!shared.tabs.length) {
+      this.#print(`${space.name} has no tabs to share.`, "dim");
+      return;
+    }
+    const copy = text =>
+      Cc["@mozilla.org/widget/clipboardhelper;1"].getService(Ci.nsIClipboardHelper).copyString(text);
+    if (args.includes("--code")) {
+      const code = encodeShareCode(shared);
+      copy(code);
+      this.#print(`Copied a share code for ${space.name} (${shared.tabs.length} tabs). Send it to a friend; they run \`import <code>\`.`, "added");
+      return;
+    }
+    if (args.includes("-y") || args.includes("--yes")) {
+      const url = await ZenGitManager.publishGist(shared);
+      copy(url);
+      this.#print(`Shared ${space.name} as a secret gist (copied): ${url}`, "added");
+      this.#print("Anyone with the link can see it. Delete it on gist.github.com to unshare.", "dim");
+      return;
+    }
+    this.#print(`Sharing ${space.name} would include ${shared.tabs.length} tab(s) and ${shared.folders.length} folder(s):`, "dim");
+    for (const tab of shared.tabs) {
+      this.#print(`  ${tab.title}  — ${tab.url}`);
+    }
+    this.#print(
+      "Secrets in URLs and sites in .browserignore are already left out. " +
+        "`share -y` publishes it as a secret GitHub gist; `share --code` copies a code instead (nothing is uploaded).",
+      "dim"
+    );
+  }
+
+  async #import(args) {
+    const input = args.join(" ").trim();
+    if (!input) {
+      this.#print("usage: import <gist link | share code>", "error");
+      return;
+    }
+    let shared = decodeShareCode(input);
+    if (!shared) {
+      const id = input.match(/gist\.github(?:usercontent)?\.com\/(?:[^/]+\/)?([0-9a-f]{8,})/i)?.[1];
+      if (!id) {
+        this.#print("That isn't a gist link or a Commit share code.", "error");
+        return;
+      }
+      const response = await this.window.fetch(`https://api.github.com/gists/${id}`, {
+        headers: { Accept: "application/vnd.github+json" },
+      });
+      if (!response.ok) {
+        this.#print(`Couldn't open that gist (${response.status}).`, "error");
+        return;
+      }
+      const gist = await response.json();
+      for (const file of Object.values(gist.files || {})) {
+        try {
+          const data = JSON.parse(file.content);
+          if (data?.format === "commit-space") {
+            shared = data;
+            break;
+          }
+        } catch {}
+      }
+      if (!shared) {
+        this.#print("That gist doesn't hold a shared Commit space.", "error");
+        return;
+      }
+    }
+    const { space, summary } = await ZenGitManager.importSpace(this.window, shared);
+    this.#print(`Added the space "${space.name}": ${summary}`, "added");
+  }
+
+  #focus(args) {
+    const { ZenFocus } = lazy;
+    if (args[0] === "off" || args[0] === "stop") {
+      if (!ZenFocus.active) {
+        this.#print("Focus mode isn't on.", "dim");
+        return;
+      }
+      ZenFocus.stop();
+      this.#print("Focus mode is off.", "dim");
+      return;
+    }
+    if (!args.length && ZenFocus.active) {
+      const until = new Date(ZenFocus.until).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      this.#print(`Focusing until ${until}. Blocked: ${ZenFocus.sites.join(", ")}`, "dim");
+      return;
+    }
+    let ms = 25 * 60000;
+    const sites = [];
+    for (const arg of args) {
+      const duration = parseDuration(arg);
+      if (duration) {
+        ms = duration;
+      } else {
+        sites.push(arg);
+      }
+    }
+    ZenFocus.start(this.window.gZenWorkspaces.activeWorkspace, ms, sites);
+    const until = new Date(Date.now() + ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    this.#print(`Focusing until ${until}. Blocked: ${ZenFocus.sites.join(", ")}`, "added");
+    this.#print("You'll stay in this space. `focus off` ends it early.", "dim");
+    this.toggle(false);
+  }
+
+  // ---------------------------------------------------------------------
+  // top, unload, gc
+
+  async #sampleProcesses(ms = 1000) {
+    const before = await ChromeUtils.requestProcInfo();
+    await new Promise(resolve => this.window.setTimeout(resolve, ms));
+    const after = await ChromeUtils.requestProcInfo();
+    return { before, after, ms };
+  }
+
+  #tabsByPid() {
+    const byPid = new Map();
+    for (const tab of this.window.gBrowser.tabs) {
+      const pid = tab.linkedBrowser?.browsingContext?.currentWindowGlobal?.osPid;
+      if (pid > 0) {
+        byPid.set(pid, [...(byPid.get(pid) || []), tab]);
+      }
+    }
+    return byPid;
+  }
+
+  async #top(args) {
+    const sortBy = args.includes("-c") || args.includes("--cpu") ? "cpu" : "memory";
+    this.#print("Measuring for a second…", "dim");
+    const { before, after, ms } = await this.#sampleProcesses();
+    const { rows, total } = processRows(before, after, ms, this.#tabsByPid(), { sortBy });
+    this.#topRows = rows;
+    this.#print(`  #     MEMORY    CPU   TABS`, "dim");
+    rows.forEach((row, i) => {
+      const n = row.pid ? String(i + 1).padStart(3) : "   ";
+      const mem = formatBytes(row.memory).padStart(8);
+      const cpu = `${Math.round(row.cpu)}%`.padStart(5);
+      let label = row.label;
+      if (row.tabs.length) {
+        let host = "";
+        try {
+          host = row.tabs[0].linkedBrowser.currentURI.host.replace(/^www\./, "");
+        } catch {}
+        const more = row.tabs.length > 1 ? `  (+${row.tabs.length - 1} more)` : "";
+        label = `${host || row.tabs[0].label} — ${row.tabs[0].label}${more}`;
+      }
+      const heavy = row.memory > 500 * 1024 * 1024 || row.cpu > 20;
+      this.#print(`${n}  ${mem}  ${cpu}   ${label}`, heavy ? "modified" : "");
+    });
+    const asleep = this.window.gBrowser.tabs.filter(t => t.hasAttribute("pending")).length;
+    this.#print(
+      `Commit is using ${formatBytes(total)}${asleep ? `; ${asleep} tab${asleep === 1 ? " is" : "s are"} asleep and use none` : ""}. ` +
+        "`unload <n>` puts one row to sleep, `gc` every background tab.",
+      "dim"
+    );
+  }
+
+  // Tabs that can sleep without you noticing: not on screen, not playing
+  // audio or a picture-in-picture video, not sharing your screen.
+  #canSleep(tab) {
+    return (
+      !tab.selected &&
+      !tab.closing &&
+      !tab.hasAttribute("pending") &&
+      !tab.soundPlaying &&
+      !tab.hasAttribute("pictureinpicture") &&
+      !tab.hasAttribute("sharing") &&
+      !tab.linkedBrowser?.docShellIsActive &&
+      tab.linkedBrowser?.isRemoteBrowser
+    );
+  }
+
+  #sleep(tabs) {
+    let slept = 0;
+    for (const tab of tabs) {
+      try {
+        if (this.#canSleep(tab) && this.window.gBrowser.discardBrowser(tab)) {
+          slept++;
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    return slept;
+  }
+
+  async #unload(args) {
+    const n = Number.parseInt(args[0], 10);
+    const row = this.#topRows[n - 1];
+    if (!row?.pid) {
+      this.#print("usage: unload <n>, with a numbered row from the last `top`", "error");
+      return;
+    }
+    const slept = this.#sleep(row.tabs.filter(t => t.isConnected));
+    const kept = row.tabs.length - slept;
+    this.#print(
+      slept
+        ? `Put ${slept} tab${slept === 1 ? "" : "s"} to sleep.${kept ? ` ${kept} stayed awake (on screen, playing, or holding unsaved input).` : ""}`
+        : "Those tabs are on screen, playing, or holding unsaved input, so they stayed awake.",
+      slept ? "added" : "dim"
+    );
+  }
+
+  async #gc() {
+    const total = info => [info, ...(info.children || [])].reduce((n, p) => n + (p.memory || 0), 0);
+    const before = total(await ChromeUtils.requestProcInfo());
+    const slept = this.#sleep([...this.window.gBrowser.tabs]);
+    if (!slept) {
+      this.#print("Every background tab is already asleep (or busy playing or sharing).", "dim");
+      return;
+    }
+    // Processes take a moment to exit once their last tab sleeps.
+    await new Promise(resolve => this.window.setTimeout(resolve, 2000));
+    const freed = before - total(await ChromeUtils.requestProcInfo());
+    this.#print(
+      `Put ${slept} background tab${slept === 1 ? "" : "s"} to sleep` +
+        (freed > 0 ? `, freeing about ${formatBytes(freed)}.` : ".") +
+        " They reload when you click them.",
+      "added"
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Music: the Spotify and Music apps (ZenNativePlayers)
+
+  #trackLine(player) {
+    const icon = player.isPlaying ? "▶" : "❚❚";
+    const position = player.getPositionState().position;
+    return `${icon} ${lazy.describeTrack({ ...player.state, position })}  (${player.name})`;
+  }
+
+  // `play spotify …` / `play music …` pick the app; otherwise the one
+  // playing, then the one paused, then Spotify, then Music.
+  async #targetPlayer(args) {
+    const players = lazy.ZenNativePlayers;
+    const named = players.player(args[0]?.toLowerCase());
+    if (named) {
+      if (!(await players.installed()).includes(named.id)) {
+        throw new Error(`${named.name} isn't installed.`);
+      }
+      return { player: named, rest: args.slice(1) };
+    }
+    const player = await players.pick();
+    if (!player) {
+      throw new Error(
+        lazy.ZenNativePlayers.denied.length
+          ? "Commit isn't allowed to control Spotify or Music. Turn it on in System Settings → Privacy & Security → Automation → Commit."
+          : "Neither Spotify nor Music is installed."
+      );
+    }
+    return { player, rest: args };
+  }
+
+  async #afterChange(player) {
+    await new Promise(resolve => this.window.setTimeout(resolve, 800));
+    await lazy.ZenNativePlayers.refresh();
+    if (player.isActive) {
+      this.#print(this.#trackLine(player), "added");
+    }
+  }
+
+  async #nowPlaying() {
+    const players = lazy.ZenNativePlayers;
+    await players.refresh();
+    let any = false;
+    for (const player of players.players) {
+      if (player.isActive) {
+        any = true;
+        this.#print(this.#trackLine(player), player.isPlaying ? "added" : "");
+      }
+    }
+    for (const tab of this.window.gBrowser.tabs) {
+      if (tab.soundPlaying) {
+        any = true;
+        this.#print(`▶ ${tab.label}  (tab)`, "added", () =>
+          this.window.gZenWorkspaces.switchTabIfNeeded(tab)
+        );
+      }
+    }
+    if (!any) {
+      this.#print("Nothing is playing.", "dim");
+    }
+    for (const id of players.denied) {
+      this.#print(
+        `Commit isn't allowed to control ${lazy.PLAYERS[id].name}: System Settings → Privacy & Security → Automation → Commit.`,
+        "modified"
+      );
+    }
+  }
+
+  async #play(args) {
+    const players = lazy.ZenNativePlayers;
+    const { player, rest } = await this.#targetPlayer(args);
+    const query = rest.join(" ").trim();
+    if (!query) {
+      await players.command(player.id, "play");
+      await this.#afterChange(player);
+      return;
+    }
+    if (player.id == "music") {
+      const found = await players.command("music", "search", [query]);
+      if (found) {
+        const [title, artist] = found.split("\u001f");
+        this.#print(`▶ ${title}${artist ? ` — ${artist}` : ""}  (Music)`, "added");
+        return;
+      }
+      const country = (Services.locale.regionalPrefsLocales[0] || "")
+        .split("-")
+        .pop()
+        .toLowerCase();
+      const { exitCode } = await players.openExternal(
+        lazy.searchURL("music", query, { country })
+      );
+      if (exitCode == 0) {
+        this.#print(
+          `Nothing in your library matches "${query}", so I opened Apple Music's search in Music.`,
+          "dim"
+        );
+        return;
+      }
+      this.#openFromConsole(
+        lazy.searchURL("music", query, { country, web: true }),
+        "tab",
+        `play ${query}`
+      );
+      this.#print(
+        `Nothing in your library matches "${query}", and Music didn't open the search, so here's Apple Music's website.`,
+        "dim"
+      );
+      return;
+    }
+    await players.openExternal(lazy.searchURL("spotify", query));
+    this.#print(
+      `Opened Spotify's search for "${query}". Pick a song there: Spotify doesn't let other apps play search results.`,
+      "dim"
+    );
+  }
+
+  async #pause(args) {
+    const { player } = await this.#targetPlayer(args);
+    if (!player.isPlaying) {
+      this.#print("Nothing is playing.", "dim");
+      return;
+    }
+    await lazy.ZenNativePlayers.command(player.id, "pause");
+    this.#print(`❚❚ Paused ${player.name}.`, "dim");
+  }
+
+  async #skip(action, args) {
+    const { player } = await this.#targetPlayer(args);
+    if (!player.isActive) {
+      this.#print(`${player.name} isn't playing anything.`, "dim");
+      return;
+    }
+    await lazy.ZenNativePlayers.command(player.id, action);
+    await this.#afterChange(player);
+  }
+
+  // ---------------------------------------------------------------------
+  // AI (ZenAI.sys.mjs, prompts in ZenAIModel.sys.mjs)
+
+  #costNote(cost) {
+    const text = lazy.AIModel.formatCost(cost);
+    return text ? ` (${text})` : "";
+  }
+
+  async #ai(args) {
+    const { ZenAI, ZenEmbeddings } = lazy;
+    const [sub, ...rest] = args;
+    if (sub == "key") {
+      if (rest[0] == "--remove" || rest[0] == "-d") {
+        await ZenAI.setKey("");
+        this.#print("Removed the API key. Claude features are off; local search still works.", "dim");
+        return;
+      }
+      let key = rest[0];
+      if (!key) {
+        const entered = { value: "" };
+        const ok = Services.prompt.promptPassword(
+          this.window,
+          "Anthropic API key",
+          "Paste an API key from console.anthropic.com. Commit keeps it in its password store.",
+          entered,
+          null,
+          {}
+        );
+        key = ok ? entered.value.trim() : "";
+        if (!key) {
+          this.#print("No key entered.", "dim");
+          return;
+        }
+      }
+      await ZenAI.setKey(key);
+      this.#print("Saved your API key in Commit's password store.", "added");
+      if (!/^sk-ant-/.test(key)) {
+        this.#print("That doesn't look like an Anthropic key (they start with sk-ant-).", "modified");
+      }
+      return;
+    }
+    if (sub == "model") {
+      const [tier, id] = rest;
+      if (tier != "fast" && tier != "smart") {
+        this.#print("usage: ai model fast|smart [model id]", "error");
+        return;
+      }
+      if (id) {
+        ZenAI.setModel(tier, id);
+      }
+      this.#print(`${tier}: ${ZenAI.model(tier)}`);
+      return;
+    }
+    if (sub == "location") {
+      if (rest[0] == "--clear" || rest[0] == "-d") {
+        Services.prefs.clearUserPref("zen.ai.location");
+        this.#print("Cleared your location. `do` won't assume where you are.", "dim");
+        return;
+      }
+      if (rest.length) {
+        Services.prefs.setStringPref("zen.ai.location", rest.join(" "));
+      }
+      const place = Services.prefs.getStringPref("zen.ai.location", "");
+      this.#print(
+        place
+          ? `Location: ${place}. \`do\` uses it for "near me" (only this text is sent).`
+          : "No location set. `ai location Houston, TX` lets `do` answer \"near me\".",
+        place ? "" : "dim"
+      );
+      return;
+    }
+    if (sub == "local") {
+      if (rest[0] == "on" || rest[0] == "off") {
+        Services.prefs.setBoolPref("zen.ai.local.enabled", rest[0] == "on");
+        this.#print(`Local search is ${rest[0]}.`, "dim");
+        return;
+      }
+      if (rest[0] == "setup") {
+        this.#print(`Downloading ${ZenEmbeddings.model} (about 0.6 GB)…`, "dim");
+        await ZenEmbeddings.setup();
+        this.#print("Done. `ai` filters now run on this Mac.", "added");
+        return;
+      }
+      const state = await ZenEmbeddings.ready();
+      this.#print(
+        state.ok ? `Local search: ready (${ZenEmbeddings.model} via Ollama)` : `Local search: not available: ${state.reason}`,
+        state.ok ? "added" : "modified"
+      );
+      return;
+    }
+    const hasKey = await ZenAI.hasKey();
+    this.#print(
+      hasKey ? "API key: set (in Commit's password store)" : "API key: not set. Run `ai key` to add one.",
+      hasKey ? "added" : "modified"
+    );
+    this.#print(`fast: ${ZenAI.model("fast")}   commit messages, catch-up, tidy, ai!`);
+    this.#print(`smart: ${ZenAI.model("smart")}   ask, do, tidy -s`);
+    this.#print("  (ai model fast|smart <id> changes them)", "dim");
+    const local = await ZenEmbeddings.ready();
+    this.#print(
+      local.ok
+        ? `local: ${ZenEmbeddings.model}   ai filters, checkout "<description>" (free, stays on this Mac)`
+        : `local: not available: ${local.reason}. ai filters use Claude instead.`,
+      local.ok ? "" : "modified"
+    );
+    const place = Services.prefs.getStringPref("zen.ai.location", "");
+    this.#print(place ? `location: ${place}   (ai location changes it)` : "location: not set   (ai location <city>)", place ? "" : "dim");
+    const { provider, note } = await lazy.ZenDo.provider();
+    this.#print(
+      provider == "tavily"
+        ? "do searches with: Tavily (your tvly login and credits)"
+        : `do searches with: Claude's web search (1¢ a search)${note ? `. ${note}` : ""}`
+    );
+    this.#print(
+      `This session: ${ZenAI.calls} Claude request${ZenAI.calls == 1 ? "" : "s"}, about ${lazy.AIModel.formatCost(ZenAI.spent) || "$0.00"}`,
+      "dim"
+    );
+  }
+
+  async #aiFilter(items, args, { claude = false } = {}) {
+    const instruction = args.join(" ").trim();
+    if (!instruction) {
+      throw new Error('usage: … | ai "<what to keep>"');
+    }
+    if (!items.length) {
+      return items;
+    }
+    if (!claude) {
+      const local = await lazy.ZenEmbeddings.ready();
+      if (local.ok) {
+        return this.#localFilter(items, instruction);
+      }
+      this.#print(`(Local search isn't available: ${local.reason}. Asking Claude instead.)`, "dim");
+    }
+    const { MAX_FILTER_ITEMS, filterRequest, jsonOf, validIndices } = lazy.AIModel;
+    if (items.length > MAX_FILTER_ITEMS) {
+      this.#print(
+        `ai: looking at the first ${MAX_FILTER_ITEMS} of ${items.length}. Put | grep or | head before it to narrow it.`,
+        "dim"
+      );
+      items = items.slice(0, MAX_FILTER_ITEMS);
+    }
+    this.#print(`Asking Claude about ${items.length} item${items.length == 1 ? "" : "s"}…`, "dim");
+    const { message, cost } = await lazy.ZenAI.send({
+      ...filterRequest(instruction, items),
+      effort: "low",
+    });
+    const kept = validIndices(jsonOf(message), items.length).map(i => items[i]);
+    this.#print(`ai! kept ${kept.length} of ${items.length}${this.#costNote(cost)}`, "dim");
+    return kept;
+  }
+
+  async #localFilter(items, instruction) {
+    const { embeddingText, selectByScore } = lazy.AIModel;
+    const texts = items.map(item => embeddingText(item.title, item.url));
+    const fresh = await lazy.ZenEmbeddings.uncached(texts);
+    if (fresh > 30) {
+      this.#print(`Reading ${fresh} new titles on this Mac (once; later searches are instant)…`, "dim");
+    }
+    const scores = await lazy.ZenEmbeddings.scores(instruction, texts);
+    const kept = selectByScore(scores).map(i => items[i]);
+    this.#print(
+      `ai kept ${kept.length} of ${items.length} (on this Mac). If it missed something, try ai! for Claude.`,
+      "dim"
+    );
+    return kept;
+  }
+
+  async #writeCommitMessage(space, status) {
+    if (
+      isClean(status) ||
+      !Services.prefs.getBoolPref("zen.ai.commit-messages", true) ||
+      !(await lazy.ZenAI.hasKey())
+    ) {
+      return "";
+    }
+    const { checkStop, cleanCommitMessage, commitMessageRequest, textOf } = lazy.AIModel;
+    try {
+      this.#print("Writing a commit message…", "dim");
+      const { message } = await lazy.ZenAI.send({
+        ...commitMessageRequest(space.name, formatDiff(status)),
+        effort: "low",
+        maxTokens: 4000,
+      });
+      checkStop(message);
+      return cleanCommitMessage(textOf(message));
+    } catch (e) {
+      this.#print(`(Claude couldn't write one, so it's a plain message: ${e.message})`, "dim");
+      return "";
+    }
+  }
+
+  async #findCommit(repo, space, description) {
+    const entries = await repo.log(300);
+    if (!entries.length) {
+      this.#print(`${space.name} has no commits to search yet.`, "dim");
+      return null;
+    }
+    const found = entry => {
+      this.#print(`Found ${entry.hash} (${entry.when}): ${entry.subject}`, "dim");
+      return entry.hash;
+    };
+    const local = await lazy.ZenEmbeddings.ready();
+    if (local.ok) {
+      const { MIN_SCORE, embeddingText } = lazy.AIModel;
+      const scores = await lazy.ZenEmbeddings.scores(
+        description,
+        entries.map(entry => embeddingText(entry.subject))
+      );
+      const best = scores.indexOf(Math.max(...scores));
+      if (scores[best] >= MIN_SCORE) {
+        return found(entries[best]);
+      }
+    }
+    if (!(await lazy.ZenAI.hasKey())) {
+      this.#print(
+        local.ok
+          ? `No commit in ${space.name} matches "${description}".`
+          : `Can't search commits: ${local.reason}, and there's no API key (\`ai key\`).`,
+        "dim"
+      );
+      return null;
+    }
+    const { jsonOf, pickCommitRequest } = lazy.AIModel;
+    this.#print(`Asking Claude to look through ${entries.length} commits in ${space.name}…`, "dim");
+    const { message, cost } = await lazy.ZenAI.send({
+      ...pickCommitRequest(description, entries),
+      effort: "low",
+    });
+    const answer = jsonOf(message);
+    const entry = answer.found ? entries[answer.index] : null;
+    if (!entry) {
+      this.#print(`No commit in ${space.name} matches "${description}".${this.#costNote(cost)}`, "dim");
+      return null;
+    }
+    return found(entry);
+  }
+
+  async #pageText(tab) {
+    try {
+      if (tab.hasAttribute("pending")) {
+        return "";
+      }
+      const actor = tab.linkedBrowser?.browsingContext?.currentWindowGlobal?.getActor("ZenGrep");
+      if (!actor) {
+        return "";
+      }
+      const timeout = new Promise(resolve => this.window.setTimeout(() => resolve(""), 3000));
+      return (await Promise.race([actor.sendQuery("ZenGrep:Text", { max: 100000 }), timeout])) || "";
+    } catch {
+      return "";
+    }
+  }
+
+  // A console line that grows as text streams in.
+  #liveText(kind = "") {
+    let line = null;
+    let raw = "";
+    const newLine = () => {
+      line = this.document.createElementNS(HTML_NS, "div");
+      line.className = `zen-git-line ${kind}`;
+      this.#output.append(line);
+      raw = "";
+    };
+    newLine();
+    return text => {
+      const parts = text.split("\n");
+      parts.forEach((part, index) => {
+        if (index > 0) {
+          newLine();
+        }
+        // Re-render the whole line, so a ** split across chunks still pairs up.
+        raw += part;
+        this.#fillRich(line, raw);
+      });
+      this.#output.scrollTop = this.#output.scrollHeight;
+    };
+  }
+
+  async #ask(args) {
+    const { askRequest, checkStop, fitDocs } = lazy.AIModel;
+    const all = args.includes("-a");
+    const question = args.filter(arg => arg != "-a").join(" ").trim();
+    if (!question) {
+      this.#print("usage: ask [-a] <question about your open tabs>", "error");
+      return;
+    }
+    const MAX_TABS = 40;
+    let tabs = this.#tabItems(all).filter(item => /^https?:/.test(item.url));
+    if (!tabs.length) {
+      this.#print("No web pages open here to ask about.", "dim");
+      return;
+    }
+    if (tabs.length > MAX_TABS) {
+      tabs = [...tabs].sort((a, b) => b.time - a.time).slice(0, MAX_TABS);
+      this.#print(`Reading your ${MAX_TABS} most recently used tabs.`, "dim");
+    }
+    this.#print(`Reading ${tabs.length} tab${tabs.length == 1 ? "" : "s"}…`, "dim");
+    const docs = await Promise.all(
+      tabs.map(async item => ({ title: item.title, url: item.url, text: await this.#pageText(item.ref) }))
+    );
+    const asleep = docs.filter(doc => !doc.text).length;
+    if (asleep) {
+      this.#print(`${asleep} of them are asleep or unreadable, so Claude only sees their titles.`, "dim");
+    }
+    const budget = Services.prefs.getIntPref("zen.ai.ask.max-chars", 120000);
+    const write = this.#liveText();
+    const { message, cost } = await lazy.ZenAI.stream(
+      { ...askRequest(question, fitDocs(docs, budget)), effort: "medium", tier: "smart" },
+      write
+    );
+    checkStop(message);
+    tabs.forEach((item, index) => {
+      this.#print(`[${index + 1}] ${item.title}  — ${item.host}`, "dim", () =>
+        item.ref.isConnected && this.window.gZenWorkspaces.switchTabIfNeeded(item.ref)
+      );
+    });
+    this.#print(`(${tabs.length} pages${this.#costNote(cost)})`, "dim");
+  }
+
+  #tidyPlan = null;
+
+  async #tidy(args) {
+    const { cleanTidyPlan, formatTidy, jsonOf, tidyIsEmpty, tidyRequest } = lazy.AIModel;
+    const workspaces = this.window.gZenWorkspaces;
+    const active = workspaces.activeWorkspace;
+    const spaces = workspaces.getWorkspaces();
+    const here = spaces.find(s => s.uuid == active);
+    if (args[0] == "apply") {
+      await this.#applyTidy(active, spaces);
+      return;
+    }
+    const items = this.#tabItems(false).filter(item => !item.essential);
+    if (items.length < 3) {
+      this.#print(`${here?.name || "This space"} only has ${items.length} tab${items.length == 1 ? "" : "s"}; nothing to tidy.`, "dim");
+      return;
+    }
+    const others = spaces.filter(s => s.uuid != active).map(s => s.name);
+    const tier = args.includes("-s") ? "smart" : "fast";
+    this.#print(`Looking at ${items.length} tabs in ${here?.name}…`, "dim");
+    const { message, cost } = await lazy.ZenAI.send({
+      ...tidyRequest(here?.name || "", items, others),
+      effort: "medium",
+      tier,
+    });
+    const plan = cleanTidyPlan(jsonOf(message), items, others);
+    if (tidyIsEmpty(plan)) {
+      this.#tidyPlan = null;
+      this.#print(`Looks tidy already.${this.#costNote(cost)}`, "dim");
+      return;
+    }
+    this.#tidyPlan = { plan, items, spaceId: active };
+    if (plan.summary) {
+      this.#print(plan.summary, "dim");
+    }
+    for (const [text, kind] of formatTidy(plan, items)) {
+      this.#print(text, kind);
+    }
+    this.#print(
+      `Nothing has changed yet. \`tidy apply\` does it${tier == "fast" ? "; `tidy -s` asks the smarter model" : ""}${this.#costNote(cost)}.`,
+      "dim"
+    );
+  }
+
+  async #applyTidy(active, spaces) {
+    const saved = this.#tidyPlan;
+    if (!saved) {
+      this.#print("Run `tidy` first to see a plan.", "error");
+      return;
+    }
+    if (saved.spaceId != active) {
+      this.#print("That plan was for another space. Switch back to it, or run `tidy` here.", "error");
+      return;
+    }
+    this.#tidyPlan = null;
+    const { plan, items } = saved;
+    const live = index => {
+      const tab = items[index]?.ref;
+      return tab?.isConnected && !tab.closing ? tab : null;
+    };
+    const counts = { folders: 0, moved: 0, closed: 0 };
+    for (const folder of plan.folders) {
+      const tabs = folder.tabs.map(live).filter(Boolean);
+      if (tabs.length >= 2) {
+        this.window.gZenFolders.createFolder(tabs, { label: folder.name, workspaceId: active });
+        counts.folders++;
+      }
+    }
+    const bySpace = new Map();
+    for (const { tab, space } of plan.move) {
+      const target = spaces.find(s => s.name == space);
+      const ref = live(tab);
+      if (target && ref) {
+        bySpace.set(target.uuid, [...(bySpace.get(target.uuid) || []), ref]);
+      }
+    }
+    for (const [uuid, tabs] of bySpace) {
+      this.window.gZenWorkspaces.moveTabsToWorkspace(tabs, uuid);
+      counts.moved += tabs.length;
+    }
+    const closing = plan.close.map(({ tab }) => live(tab)).filter(Boolean);
+    if (closing.length) {
+      this.window.gBrowser.removeTabs(closing);
+      counts.closed = closing.length;
+    }
+    this.#print(
+      `Made ${counts.folders} folder${counts.folders == 1 ? "" : "s"}, moved ${counts.moved} tab${counts.moved == 1 ? "" : "s"}, closed ${counts.closed}. ` +
+        "`checkout` or time travel brings anything back.",
+      "added"
+    );
+  }
+
+  async #catchUp() {
+    const lines = await lazy.ZenAIWindow.catchUp(this.window, { force: true });
+    if (!lines?.length) {
+      this.#print("Nothing to catch up on in this space yet.", "dim");
+      return;
+    }
+    for (const line of lines) {
+      this.#print(line);
+    }
+  }
+
+  #doSources = [];
+  #doTask = "";
+
+  async #do(args) {
+    if (args[0] == "open" && args.length == 1) {
+      await this.#openDoSources();
+      return;
+    }
+    const task = args.join(" ").trim();
+    if (!task) {
+      this.#print("usage: do <task>   e.g. do find 3 flights to Tokyo under $600 in March", "error");
+      return;
+    }
+    const { provider } = await lazy.ZenDo.provider();
+    this.#print(
+      `On it, searching with ${provider == "tavily" ? "Tavily" : "Claude's web search"}. ` +
+        "Claude can only search and read. This can take a minute or two.",
+      "dim"
+    );
+    const result = await lazy.ZenDo.run(task, {
+      onProgress: line => this.#print(`  ${line}`, "dim"),
+    });
+    this.#printRich(result.text || "(no answer)");
+    this.#doSources = result.sources;
+    this.#doTask = task;
+    result.sources.slice(0, 12).forEach((source, index) => {
+      this.#print(`[${index + 1}] ${source.title}`, "dim", () =>
+        this.#openFromConsole(source.url, "tab", `do ${task}`)
+      );
+    });
+    const spent = [
+      lazy.AIModel.formatCost(result.cost) || "$0.00",
+      result.credits && `${result.credits} Tavily credit${result.credits == 1 ? "" : "s"}`,
+    ].filter(Boolean);
+    if (result.cached >= 0.05) {
+      spent[0] += `, ${Math.round(result.cached * 100)}% read from cache`;
+    }
+    this.#print(
+      `(${spent.join(" + ")}${result.sources.length ? ". `do open` opens the sources in a new space" : ""})`,
+      "dim"
+    );
+  }
+
+  async #openDoSources() {
+    if (!this.#doSources.length) {
+      this.#print("Run `do <task>` first.", "error");
+      return;
+    }
+    const name = `do: ${this.#doTask}`.slice(0, 32);
+    await this.window.gZenWorkspaces.createAndSaveWorkspace(name);
+    this.#consoleOpening = `do ${this.#doTask}`;
+    try {
+      for (const source of this.#doSources.slice(0, 12)) {
+        this.window.openTrustedLinkIn(source.url, "tab", { inBackground: true });
+      }
+    } finally {
+      this.window.setTimeout(() => (this.#consoleOpening = null), 0);
+    }
+    this.#print(`Opened ${Math.min(12, this.#doSources.length)} sources in the space "${name}".`, "added");
+  }
+
+  // ---------------------------------------------------------------------
+  // Pipes (ZenPipes.sys.mjs): ls -a | grep youtube | close
+
+  async #pipe(line) {
+    const stages = splitPipeline(line).map(tokenize);
+    checkPipeline(stages);
+    const [[source, ...sourceArgs], ...rest] = stages;
+    const showSpace =
+      source == "ls" && (sourceArgs.includes("-a") || sourceArgs.includes("--all"));
+    let items =
+      source == "ls"
+        ? this.#tabItems(showSpace)
+        : await this.#historyItems(sourceArgs);
+    for (const [name, ...args] of rest) {
+      if (PIPE_ACTIONS.includes(name)) {
+        await this.#pipeAction(name, args, items, line);
+        return;
+      }
+      items =
+        name == "ai" || name == "ai!"
+          ? await this.#aiFilter(items, args, { claude: name == "ai!" })
+          : applyFilter(items, name, args);
+    }
+    this.#printItems(items, { showSpace });
+  }
+
+  #tabItems(all) {
+    const workspaces = this.window.gZenWorkspaces;
+    const active = workspaces.activeWorkspace;
+    const spaces = new Map(
+      workspaces.getWorkspaces().map(s => [s.uuid, s.name])
+    );
+    const items = [];
+    for (const tab of workspaces.allStoredTabs) {
+      if (
+        tab.closing ||
+        tab.hasAttribute("zen-empty-tab") ||
+        tab.hasAttribute("zen-glance-tab")
+      ) {
+        continue;
+      }
+      const essential = tab.hasAttribute("zen-essential");
+      const spaceId = tab.getAttribute("zen-workspace-id");
+      if (!all && !essential && spaceId !== active) {
+        continue;
+      }
+      let url = "";
+      let host = "";
+      try {
+        url = tab.linkedBrowser.currentURI.spec;
+        host = tab.linkedBrowser.currentURI.host.replace(/^www\./, "");
+      } catch {}
+      items.push({
+        kind: "tab",
+        title: tab.label,
+        url,
+        host,
+        space: essential ? "essentials" : spaces.get(spaceId) || "",
+        time: tab.selected ? Date.now() : tab.lastAccessed || 0,
+        essential,
+        folder: tab.group?.label || "",
+        ref: tab,
+      });
+    }
+    return items;
+  }
+
+  async #historyItems(args) {
+    const { from, to, search } = historyRange(args);
+    const db = await lazy.PlacesUtils.promiseDBConnection();
+    const rows = await db.executeCached(
+      `SELECT p.url AS url, p.title AS title, MAX(v.visit_date) AS last
+       FROM moz_historyvisits v JOIN moz_places p ON p.id = v.place_id
+       WHERE v.visit_date >= :from AND v.visit_date < :to AND p.hidden = 0
+       GROUP BY p.id ORDER BY last DESC LIMIT 2000`,
+      { from: from * 1000, to: to * 1000 }
+    );
+    let items = rows.map(row => {
+      const url = row.getResultByName("url");
+      let host = "";
+      try {
+        host = new URL(url).host.replace(/^www\./, "");
+      } catch {}
+      return {
+        kind: "page",
+        title: row.getResultByName("title") || "",
+        url,
+        host,
+        time: row.getResultByName("last") / 1000,
+      };
+    });
+    if (search.length) {
+      items = applyFilter(items, "grep", search);
+    }
+    return items;
+  }
+
+  #printItems(items, { showSpace = false } = {}) {
+    if (!items.length) {
+      this.#print("(nothing)", "dim");
+      return;
+    }
+    const today = new Date().toDateString();
+    const formatTime = ms => {
+      const date = new Date(ms);
+      return date.toDateString() == today
+        ? date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).padStart(8)
+        : date.toLocaleDateString([], { month: "short", day: "numeric" }).padStart(8);
+    };
+    const MAX = 200;
+    for (const item of items.slice(0, MAX)) {
+      const onClick =
+        item.kind == "tab"
+          ? () => item.ref.isConnected && this.window.gZenWorkspaces.switchTabIfNeeded(item.ref)
+          : () => this.#openFromConsole(item.url, "tab", "history");
+      this.#print(formatItem(item, { showSpace, formatTime }), "", onClick);
+    }
+    const more = items.length > MAX ? `, showing ${MAX}; add | head or | grep` : "";
+    this.#print(`(${items.length} ${items[0].kind == "tab" ? "tab" : "page"}${items.length == 1 ? "" : "s"}${more})`, "dim");
+  }
+
+  // Big pipes ask for -f first, showing what they'd do.
+  #needsForce(verb, list, args, line) {
+    const LIMIT = 10;
+    if (list.length <= LIMIT || args.includes("-f")) {
+      return false;
+    }
+    this.#print(`This would ${verb} ${list.length}:`, "modified");
+    for (const item of list.slice(0, 5)) {
+      this.#print(`  ${formatItem(item)}`, "dim");
+    }
+    this.#print(`  …and ${list.length - 5} more`, "dim");
+    this.#print(`Run it with -f to go ahead: ${line} -f`, "dim");
+    return true;
+  }
+
+  async #pipeAction(name, args, items, line) {
+    const tabs = items.filter(item => item.kind == "tab" && item.ref.isConnected);
+    const needsTabs = ["close", "sleep", "mv"].includes(name);
+    if (needsTabs && items.some(item => item.kind != "tab")) {
+      throw new Error(`${name} works on tabs: start the pipe with ls`);
+    }
+    const plural = (n, word) => `${n} ${word}${n == 1 ? "" : "s"}`;
+    switch (name) {
+      case "wc":
+        this.#print(String(items.length));
+        return;
+      case "copy": {
+        const urls = items.map(item => item.url).filter(Boolean);
+        Cc["@mozilla.org/widget/clipboardhelper;1"]
+          .getService(Ci.nsIClipboardHelper)
+          .copyString(urls.join("\n"));
+        this.#print(`Copied ${plural(urls.length, "URL")}.`, "added");
+        return;
+      }
+      case "open": {
+        const list = items.filter(item => item.url);
+        if (this.#needsForce("open", list, args, line)) {
+          return;
+        }
+        this.#consoleOpening = line;
+        try {
+          for (const item of list) {
+            this.window.openTrustedLinkIn(item.url, "tab", { inBackground: true });
+          }
+        } finally {
+          this.window.setTimeout(() => (this.#consoleOpening = null), 0);
+        }
+        this.#print(`Opened ${plural(list.length, "tab")} in the background.`, "added");
+        return;
+      }
+      case "close": {
+        const force = args.includes("-f");
+        // Essentials stay unless you say -f: they're meant to be permanent.
+        const list = tabs.filter(item => force || !item.essential);
+        const kept = tabs.length - list.length;
+        if (this.#needsForce("close", list, args, line)) {
+          return;
+        }
+        this.window.gBrowser.removeTabs(list.map(item => item.ref));
+        this.#print(
+          `Closed ${plural(list.length, "tab")}.` +
+            (kept ? ` Kept ${plural(kept, "Essential")} (close -f closes those too).` : ""),
+          list.length ? "deleted" : "dim"
+        );
+        return;
+      }
+      case "sleep": {
+        const slept = this.#sleep(tabs.map(item => item.ref));
+        const busy = tabs.length - slept;
+        this.#print(
+          `Put ${plural(slept, "tab")} to sleep.` +
+            (busy ? ` ${busy} stayed awake (on screen, playing, sharing or already asleep).` : ""),
+          slept ? "added" : "dim"
+        );
+        return;
+      }
+      case "mv": {
+        const target = args.filter(arg => arg != "-f").join(" ").toLowerCase();
+        if (!target) {
+          throw new Error("usage: … | mv <space name>");
+        }
+        const spaces = this.window.gZenWorkspaces.getWorkspaces();
+        const space =
+          spaces.find(s => s.name.toLowerCase() == target) ||
+          spaces.find(s => s.name.toLowerCase().startsWith(target));
+        if (!space) {
+          throw new Error(`mv: no space called "${target}". Spaces: ${spaces.map(s => s.name).join(", ")}`);
+        }
+        const list = tabs.filter(item => !item.essential);
+        if (this.#needsForce(`move to ${space.name}`, list, args, line)) {
+          return;
+        }
+        this.window.gZenWorkspaces.moveTabsToWorkspace(
+          list.map(item => item.ref),
+          space.uuid
+        );
+        this.#print(`Moved ${plural(list.length, "tab")} to ${space.name}.`, "added");
+        return;
+      }
+    }
+  }
+
   #printResult({ summary, warnings }) {
     this.#print(summary, "dim");
     for (const warning of warnings) {
@@ -914,7 +2425,31 @@ export class ZenGitConsole extends ZenUIComponent {
       return;
     }
     if (!rest[0]) {
-      this.#print("usage: checkout <branch|commit> [-f]", "error");
+      this.#print("usage: checkout <branch|commit|time> [-f]", "error");
+      return;
+    }
+    const when = rest.join(" ");
+    const { repo, space } = await ZenGitManager.activeSpaceRepo(this.window);
+    const isRev = !!(await repo.revKind(rest[0]));
+    // "the week I planned Tokyo" has a time word in it but is a description.
+    if (
+      !isRev &&
+      lazy.AIModel.looksLikeDescription(rest) &&
+      !lazy.AIModel.isJustATime(when)
+    ) {
+      const found = await this.#findCommit(repo, space, when);
+      if (!found) {
+        return;
+      }
+      rest.splice(0, rest.length, found);
+    } else if (!isRev && looksLikeTime(when)) {
+      const travelled = await ZenGitManager.travel(this.window, when, { force });
+      this.#print(
+        `${travelled.space.name} is back the way it was on ${travelled.date}. ` +
+          "`commit` keeps it, `checkout -f <branch>` goes back.",
+        "added"
+      );
+      this.#printResult(travelled);
       return;
     }
     const result = await ZenGitManager.checkout(this.window, rest[0], {

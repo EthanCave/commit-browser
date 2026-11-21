@@ -16,7 +16,11 @@ import {
   computeStatus,
   essentialsSnapshot,
   isClean,
+  looksLikeTime,
   mergeStatuses,
+  selectTabs,
+  toSharedSpace,
+  fromSharedSpace,
   normalizeSettings,
   planCheckout,
   retargetSpace,
@@ -35,6 +39,8 @@ ChromeUtils.defineESModuleGetters(lazy, {
   SessionStore:
     "moz-src:///browser/components/sessionstore/SessionStore.sys.mjs",
   BrowserWindowTracker: "resource:///modules/BrowserWindowTracker.sys.mjs",
+  setInterval: "resource://gre/modules/Timer.sys.mjs",
+  setTimeout: "resource://gre/modules/Timer.sys.mjs",
 });
 
 XPCOMUtils.defineLazyPreferenceGetter(
@@ -120,7 +126,7 @@ class nsZenGitManager {
     if (!this.#repo || this.#repo.dir !== this.repoDir) {
       this.#repo = new ZenGitRepo({
         dir: this.repoDir,
-        exec: (args, cwd) => this.#exec(args, cwd),
+        exec: (args, cwd, env) => this.#exec(args, cwd, env),
         fs: ioFs,
       });
       this.#spaceRepos.clear();
@@ -153,7 +159,7 @@ class nsZenGitManager {
     return this.#gitPath;
   }
 
-  async #exec(args, cwd) {
+  async #exec(args, cwd, env = {}) {
     const command = await this.#findGit();
     await IOUtils.makeDirectory(cwd, {
       createAncestors: true,
@@ -169,6 +175,7 @@ class nsZenGitManager {
         PATH: EXTRA_PATH.join(":"),
         // Fail instead of waiting for a password prompt nobody can see.
         GIT_TERMINAL_PROMPT: "0",
+        ...env,
       },
     });
     proc.stdin.close();
@@ -406,7 +413,7 @@ class nsZenGitManager {
     if (!repo) {
       repo = new ZenGitRepo({
         dir: PathUtils.join(this.repoDir, WORKTREES_DIR, key),
-        exec: (args, cwd) => this.#exec(args, cwd),
+        exec: (args, cwd, env) => this.#exec(args, cwd, env),
         fs: ioFs,
         codec,
         branchPrefix,
@@ -451,7 +458,7 @@ class nsZenGitManager {
       // Start from what the older whole-window layout had for it.
       const legacy = await new ZenGitRepo({
         dir: shared.dir,
-        exec: (args, cwd) => this.#exec(args, cwd),
+        exec: (args, cwd, env) => this.#exec(args, cwd, env),
         fs: ioFs,
         codec,
       }).readSnapshot("HEAD");
@@ -1285,6 +1292,387 @@ class nsZenGitManager {
       const result = await this.repo.tryGit(...args);
       this.#forgetHeads();
       return result;
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Time travel
+
+  #timeRef(key) {
+    return `refs/zen/time/${key === ESSENTIALS_KEY ? "_essentials" : key}`;
+  }
+
+  /**
+   * Saves every space and Essentials to their time-travel refs, skipping
+   * the ones that haven't changed since the last snapshot.
+   *
+   * @param {Window} window
+   * @returns {Promise<number>} How many snapshots were written.
+   */
+  snapshotNow(window) {
+    return this.#serialize(async () => {
+      const full = await this.currentSnapshot(window);
+      let written = 0;
+      for (const space of window.gZenWorkspaces.getWorkspaces()) {
+        const { repo, slug } = await this.#spaceRepo(space);
+        if (
+          await repo.snapshotToRef(
+            this.#timeRef(slug),
+            spaceSnapshot(full, space.uuid),
+            `${space.name} at ${new Date().toLocaleString()}`
+          )
+        ) {
+          written++;
+        }
+      }
+      const essentials = await this.#essentialsRepo();
+      if (
+        await essentials.snapshotToRef(
+          this.#timeRef(ESSENTIALS_KEY),
+          essentialsSnapshot(full),
+          `Essentials at ${new Date().toLocaleString()}`
+        )
+      ) {
+        written++;
+      }
+      return written;
+    });
+  }
+
+  #timeTravelStarted = false;
+
+  /**
+   * Starts the hourly snapshots behind time travel (once per session).
+   */
+  startTimeTravel() {
+    if (
+      this.#timeTravelStarted ||
+      !Services.prefs.getBoolPref("zen.git.time-travel.enabled", true)
+    ) {
+      return;
+    }
+    this.#timeTravelStarted = true;
+    const minutes = Math.max(
+      5,
+      Services.prefs.getIntPref("zen.git.time-travel.interval-minutes", 60)
+    );
+    const tick = () => {
+      const window = this.topWindow;
+      if (window && !window.closed && window.gZenWorkspaces) {
+        this.snapshotNow(window).catch(e =>
+          console.warn("Commit: time-travel snapshot failed:", e)
+        );
+      }
+    };
+    lazy.setTimeout(tick, 2 * 60 * 1000);
+    lazy.setInterval(tick, minutes * 60 * 1000);
+  }
+
+  /**
+   * The active space's layout at a past moment.
+   *
+   * @param {Window} window
+   * @param {string} when
+   * @returns {Promise<{space: object, date: string, snapshot: object}>}
+   */
+  async #spaceAt(window, when) {
+    const space = this.activeSpace(window);
+    const { repo, slug } = await this.#spaceRepo(space);
+    const found = await repo.snapshotAt(this.#timeRef(slug), when);
+    if (!found?.snapshot) {
+      const first = (await repo.timeline(this.#timeRef(slug), 1000)).at(-1);
+      throw new Error(
+        first
+          ? `No snapshot of "${space.name}" from ${when}. The oldest is from ${first.date}.`
+          : `"${space.name}" has no snapshots yet. They're taken every hour while Commit is open.`
+      );
+    }
+    return {
+      space,
+      date: found.date,
+      snapshot: retargetSpace(found.snapshot, this.#live(space)),
+    };
+  }
+
+  /**
+   * Puts the active space back the way it was at a past moment. The tabs
+   * come back as uncommitted changes, like `checkout <commit>`.
+   *
+   * @param {Window} window
+   * @param {string} when
+   * @param {{force?: boolean}} [options]
+   */
+  travel(window, when, { force = false } = {}) {
+    return this.#serialize(async () => {
+      const { space, date, snapshot } = await this.#spaceAt(window, when);
+      await this.#requireClean(window, force, "checkout");
+      const result = await this.#apply(
+        window,
+        await this.#currentSpaceSnapshot(window, space),
+        snapshot
+      );
+      await this.#refreshNow(window);
+      return { ...result, date, space };
+    });
+  }
+
+  /**
+   * @param {Window} window
+   * @param {string} when
+   * @returns {Promise<{status: object, date: string, space: object}>} What
+   *   changed in the active space since then.
+   */
+  diffSince(window, when) {
+    return this.#serialize(async () => {
+      const { space, date, snapshot } = await this.#spaceAt(window, when);
+      const current = await this.#currentSpaceSnapshot(window, space);
+      return { status: computeStatus(current, snapshot), date, space };
+    });
+  }
+
+  /**
+   * @param {Window} window
+   * @returns {Promise<{space: object, entries: object[]}>}
+   */
+  timeline(window) {
+    return this.#serialize(async () => {
+      const space = this.activeSpace(window);
+      const { repo, slug } = await this.#spaceRepo(space);
+      return { space, entries: await repo.timeline(this.#timeRef(slug), 40) };
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // cherry-pick, share, blame
+
+  /**
+   * Finds the tabs `cherry-pick <source>` offers: a branch of this space, a
+   * moment in time, another space (its open tabs), or <space>/<branch>.
+   *
+   * @param {Window} window
+   * @param {string} source
+   * @returns {Promise<{label: string, tabs: object[]}>}
+   */
+  pickSource(window, source) {
+    return this.#serialize(async () => {
+      const space = this.activeSpace(window);
+      const { repo, slug } = await this.#spaceRepo(space);
+      const tabsOf = snapshot => snapshot?.spaces?.[0]?.tabs || [];
+
+      if ((await repo.revKind(source)) === "branch") {
+        return {
+          label: `${space.name}/${source}`,
+          tabs: tabsOf(await repo.readSnapshot(source)),
+        };
+      }
+      const spaces = window.gZenWorkspaces.getWorkspaces();
+      const findSpace = name =>
+        spaces.find(
+          s => s.uuid !== space.uuid &&
+            (s.name.toLowerCase() === name.toLowerCase() || slugify(s.name) === slugify(name))
+        );
+      const [spaceName, ...branchParts] = source.split("/");
+      const other = findSpace(spaceName);
+      if (other && !branchParts.length) {
+        const full = await this.currentSnapshot(window);
+        return { label: `${other.name} (open tabs)`, tabs: tabsOf(spaceSnapshot(full, other.uuid)) };
+      }
+      if (other && branchParts.length) {
+        const branch = branchParts.join("/");
+        const { repo: otherRepo } = await this.#spaceRepo(other);
+        if ((await otherRepo.revKind(branch)) !== "branch") {
+          throw new Error(`"${other.name}" has no branch '${branch}'.`);
+        }
+        return {
+          label: `${other.name}/${branch}`,
+          tabs: tabsOf(await otherRepo.readSnapshot(branch)),
+        };
+      }
+      if (looksLikeTime(source)) {
+        const found = await repo.snapshotAt(this.#timeRef(slug), source);
+        if (found?.snapshot) {
+          return { label: `${space.name} at ${found.date}`, tabs: tabsOf(found.snapshot) };
+        }
+        throw new Error(`No snapshot of "${space.name}" from ${source}.`);
+      }
+      const kind = await repo.revKind(source);
+      if (kind === "commit") {
+        return { label: `${space.name} at ${source}`, tabs: tabsOf(await repo.readSnapshot(source)) };
+      }
+      throw new Error(
+        `cherry-pick: '${source}' isn't a branch, another space, <space>/<branch> or a time.`
+      );
+    });
+  }
+
+  /**
+   * Opens copies of tabs in the active space (as loose or pinned tabs; their
+   * folders aren't copied). Tabs already open here are skipped.
+   *
+   * @param {Window} window
+   * @param {object[]} tabs From pickSource.
+   * @returns {Promise<{opened: object[], skipped: object[]}>}
+   */
+  cherryPick(window, tabs) {
+    return this.#serialize(async () => {
+      const space = this.activeSpace(window);
+      const full = await this.currentSnapshot(window);
+      const here = new Set(spaceSnapshot(full, space.uuid).spaces[0].tabs.map(t => t.url));
+      const { gBrowser, gZenWorkspaces } = window;
+      const principal = Services.scriptSecurityManager.getSystemPrincipal();
+      const opened = [];
+      const skipped = [];
+      for (const info of tabs) {
+        if (here.has(info.url)) {
+          skipped.push(info);
+          continue;
+        }
+        const tab = gBrowser.addTab(info.url, {
+          triggeringPrincipal: principal,
+          createLazyBrowser: true,
+          skipAnimation: true,
+          inBackground: true,
+        });
+        try {
+          gBrowser.setInitialTabTitle(tab, info.title, { isContentTitle: true });
+        } catch {}
+        if (info.pinned) {
+          gBrowser.pinTab(tab);
+        }
+        gZenWorkspaces.moveTabToWorkspace(tab, space.uuid);
+        here.add(info.url);
+        opened.push(info);
+      }
+      await this.#refreshNow(window);
+      return { opened, skipped };
+    });
+  }
+
+  /**
+   * @param {Window} window
+   * @returns {Promise<{space: object, shared: object}>} The active space in
+   *   the portable `share` format (already cleaned of secrets and
+   *   .browserignore'd sites).
+   */
+  sharedSpace(window) {
+    return this.#serialize(async () => {
+      const space = this.activeSpace(window);
+      const snapshot = await this.#currentSpaceSnapshot(window, space);
+      return { space, shared: toSharedSpace(snapshot.spaces[0]) };
+    });
+  }
+
+  /**
+   * Publishes a shared space as a secret GitHub gist with `gh`.
+   *
+   * @param {object} shared
+   * @returns {Promise<string>} The gist's URL.
+   */
+  async publishGist(shared) {
+    let gh;
+    try {
+      gh = await lazy.Subprocess.pathSearch("gh", { PATH: EXTRA_PATH.join(":") });
+    } catch {
+      throw new Error(
+        "share -y needs the GitHub CLI (brew install gh, then gh auth login). `share --code` works without it."
+      );
+    }
+    const file = PathUtils.join(
+      PathUtils.tempDir,
+      `${slugify(shared.name)}.commit-space.json`
+    );
+    await IOUtils.writeUTF8(file, JSON.stringify(shared, null, 2) + "\n");
+    try {
+      const proc = await lazy.Subprocess.call({
+        command: gh,
+        arguments: ["gist", "create", "--desc", `Commit space: ${shared.name}`, file],
+        stderr: "stdout",
+        environmentAppend: true,
+        environment: { PATH: EXTRA_PATH.join(":"), GH_PROMPT_DISABLED: "1" },
+      });
+      proc.stdin.close();
+      let output = "";
+      let chunk;
+      while ((chunk = await proc.stdout.readString())) {
+        output += chunk;
+      }
+      const { exitCode } = await proc.wait();
+      const url = output.match(/https:\/\/gist\.github\.com\/\S+/)?.[0];
+      if (exitCode || !url) {
+        throw new Error(output.trim() || "gh gist create failed");
+      }
+      return url;
+    } finally {
+      await IOUtils.remove(file, { ignoreAbsent: true });
+    }
+  }
+
+  /**
+   * Creates a new space from a shared one and opens its tabs.
+   *
+   * @param {Window} window
+   * @param {object} shared
+   * @returns {Promise<{space: object, summary: string}>}
+   */
+  importSpace(window, shared) {
+    return this.#serialize(async () => {
+      const { gZenWorkspaces } = window;
+      const taken = new Set(gZenWorkspaces.getWorkspaces().map(s => s.name));
+      let name = String(shared?.name || "Shared space");
+      for (let n = 2; taken.has(name); n++) {
+        name = `${shared.name} ${n}`;
+      }
+      // Validate before creating anything.
+      fromSharedSpace(shared, { id: "check", name }, "check");
+      const created = await gZenWorkspaces.createAndSaveWorkspace(
+        name,
+        shared.icon || undefined
+      );
+      const target = fromSharedSpace(
+        shared,
+        { id: created.uuid, name: created.name, icon: created.icon ?? null },
+        `import-${Date.now().toString(36)}`
+      );
+      const current = spaceSnapshot(await this.currentSnapshot(window), created.uuid);
+      const { summary } = await this.#apply(window, current, target);
+      await gZenWorkspaces.changeWorkspaceWithID(created.uuid);
+      await this.#refreshNow(window);
+      return { space: created, summary };
+    });
+  }
+
+  /**
+   * The commit that first saved a tab in its space's current branch.
+   *
+   * @param {Window} window
+   * @param {MozTabbrowserTab} tab
+   * @returns {Promise<{hash: string, ago: string, subject: string, branch: string}|null>}
+   */
+  firstCommitOf(window, tab) {
+    return this.#serialize(async () => {
+      const spaceId = tab.getAttribute("zen-workspace-id");
+      const space =
+        window.gZenWorkspaces.getWorkspaces().find(s => s.uuid === spaceId) ||
+        this.activeSpace(window);
+      const repo = tab.hasAttribute("zen-essential")
+        ? await this.#essentialsRepo()
+        : (await this.#spaceRepo(space)).repo;
+      if (!(await repo.hasCommits())) {
+        return null;
+      }
+      const result = await repo.tryGit(
+        "log",
+        "--reverse",
+        "--format=%h%x1f%ar%x1f%s",
+        "-S",
+        tab.id,
+        "--"
+      );
+      const [hash, ago, subject] = (result.output.split("\n")[0] || "").split("\x1f");
+      if (result.exitCode || !hash) {
+        return null;
+      }
+      return { hash, ago, subject, branch: (await repo.currentBranch()) || "main" };
     });
   }
 

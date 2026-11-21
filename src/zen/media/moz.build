@@ -4,4 +4,6 @@
 
 EXTRA_JS_MODULES.zen.media += [
     "ZenMediaController.sys.mjs",
+    "ZenNativePlayers.sys.mjs",
+    "ZenNativePlayersModel.sys.mjs",
 ]

@@ -7,6 +7,9 @@ import { XPCOMUtils } from "resource://gre/modules/XPCOMUtils.sys.mjs";
 import { PictureInPicture } from "moz-src:///toolkit/components/pictureinpicture/PictureInPicture.sys.mjs";
 
 const lazy = {};
+ChromeUtils.defineESModuleGetters(lazy, {
+  ZenNativePlayers: "resource:///modules/zen/media/ZenNativePlayers.sys.mjs",
+});
 XPCOMUtils.defineLazyPreferenceGetter(
   lazy,
   "RESPECT_PIP_DISABLED",
@@ -304,12 +307,17 @@ class ZenMediaCard {
     return `${minutes}:${secs.padStart(2, "0")}`;
   }
 
+  get isNative() {
+    return !!this.controller?.isNative;
+  }
+
   updateMuteState() {
     this.element.toggleAttribute("muted", this.browser.audioMuted);
   }
 
   updatePipButton() {
-    if (this.isSharing) {
+    // Spotify and Music cards (ZenNativePlayers) have no tab to pop out.
+    if (this.isSharing || this.isNative) {
       this.element.removeAttribute("can-pip");
       return;
     }
@@ -515,6 +523,29 @@ export class ZenMediaController extends ZenUIComponent {
       }
       this.onAudioPlaybackStarted(tab.linkedBrowser);
     });
+
+    lazy.ZenNativePlayers.watch(this);
+  }
+
+  /**
+   * Shows a card for the Spotify or Music app (see ZenNativePlayers) when it
+   * starts playing. The card goes away when the app stops or quits; closing
+   * it pauses the app, and it comes back the next time the app plays.
+   *
+   * @param {NativePlayer} player
+   */
+  showNativePlayer(player) {
+    const key = `native-${player.id}`;
+    if (!this.mediaControlBar || this.#cards.has(key)) {
+      return;
+    }
+    const card = this.#addCard(key, player.browser, player);
+    if (!card) {
+      return;
+    }
+    card.element.setAttribute("native", player.id);
+    card.element.setAttribute("tooltiptext", player.name);
+    card.refreshVisibility();
   }
 
   onAudioPlaybackStarted(browser) {
@@ -644,6 +675,7 @@ export class ZenMediaController extends ZenUIComponent {
   }
 
   uninit() {
+    lazy.ZenNativePlayers.unwatch(this);
     for (const card of this.#cards.values()) {
       card.teardown();
       card.element.remove();

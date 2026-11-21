@@ -7,4 +7,7 @@ EXTRA_JS_MODULES.zen.git += [
     "ZenGitManager.sys.mjs",
     "ZenGitModel.sys.mjs",
     "ZenGitRepo.sys.mjs",
+    "ZenGrepChild.sys.mjs",
+    "ZenGrepParent.sys.mjs",
+    "ZenPipes.sys.mjs",
 ]
