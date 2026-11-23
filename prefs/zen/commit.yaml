@@ -83,3 +83,20 @@
 # Claude's web search), "tavily", or "anthropic".
 - name: zen.ai.do.search
   value: "auto"
+
+# Updates come from github.com/EthanCave/commit-browser releases. The update
+# URL is compiled in by src/build/moz-build.patch; the release notes and
+# manual download links are set in ZenUIMigration.sys.mjs, because surfer's
+# branding prefs would override them here.
+
+# At startup, check for updates right away when this build is more than 6
+# days old. prefs/firefox/browser.yaml sets this only for official builds,
+# which Commit isn't, so the check threw on every startup.
+- name: app.update.checkInstallTime.days
+  value: 6
+
+# Show "Restart to update Commit" in the app menu as soon as an update is
+# downloaded, instead of after four days. It installs on the next restart
+# either way.
+- name: app.update.badgeWaitTime
+  value: 0

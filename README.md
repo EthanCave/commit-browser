@@ -73,6 +73,8 @@ Found 3f2a91c (3 weeks ago): Planning Tokyo trip: flights and two hotels
 
 Requires an Apple Silicon Mac. Tested on macOS 26.
 
+Commit 0.1.1 and later update themselves: a new version downloads in the background and installs the next time you restart Commit (the app menu says **Restart to update Commit** when one is ready). Updates are signed, and Commit only installs ones signed with its own key.
+
 ### Optional setup
 
 | For | Do this (in the console, Ctrl+\`) |
@@ -102,7 +104,7 @@ npm run build
 npm start
 ```
 
-Tests for Commit's own code: `npm run test:commit`. Commit's features live in `src/zen/git`, `src/zen/ai`, `src/zen/media`, `src/zen/focus` and `src/zen/archive`.
+Tests for Commit's own code: `npm run test:commit`. Releases (the DMG, the signed update and its manifest) come from `scripts/commit-release.sh`; the top of that file explains the steps. Commit's features live in `src/zen/git`, `src/zen/ai`, `src/zen/media`, `src/zen/focus` and `src/zen/archive`.
 
 ## Credits and license
 

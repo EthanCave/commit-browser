@@ -18,6 +18,7 @@ class nsZenUIMigration {
   MIGRATION_VERSION = 8;
 
   init(isNewProfile) {
+    this.#useCommitReleaseURLs();
     if (!isNewProfile) {
       try {
         this._migrate();
@@ -31,6 +32,24 @@ class nsZenUIMigration {
       Services.startup.quit(
         Ci.nsIAppStartup.eAttemptQuit | Ci.nsIAppStartup.eRestart
       );
+    }
+  }
+
+  // Commit's release notes and manual download links. surfer's branding step
+  // writes zen-browser.app ones into firefox-branding.js, which loads after
+  // (and so overrides) prefs/zen/*.yaml, so they are set here instead.
+  #useCommitReleaseURLs() {
+    const releases = "https://github.com/EthanCave/commit-browser/releases";
+    const urls = {
+      "app.update.url.manual": `${releases}/latest`,
+      "app.update.url.details": `${releases}/latest`,
+      "app.releaseNotesURL": releases,
+      "app.releaseNotesURL.aboutDialog": `${releases}/tag/v%VERSION%`,
+      "app.releaseNotesURL.prompt": `${releases}/tag/v%VERSION%`,
+    };
+    const defaults = Services.prefs.getDefaultBranch("");
+    for (const [name, url] of Object.entries(urls)) {
+      defaults.setStringPref(name, url);
     }
   }
 

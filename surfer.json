@@ -53,9 +53,9 @@
       "brandShortName": "Commit",
       "brandFullName": "Commit",
       "release": {
-        "displayVersion": "0.1.0",
+        "displayVersion": "0.1.1",
         "github": {
-          "repo": "EthanCave/desktop"
+          "repo": "EthanCave/commit-browser"
         }
       }
     }
