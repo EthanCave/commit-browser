@@ -24,12 +24,20 @@ import {
 } from "./ZenGitModel.sys.mjs";
 import {
   PIPE_ACTIONS,
+  STARTUP_TEMPLATE,
   applyFilter,
   checkPipeline,
+  expandLine,
+  formatAlias,
   formatItem,
   historyRange,
   isPipeline,
+  parseAliasDefinition,
+  removeAliasFromText,
+  setAliasInText,
   splitPipeline,
+  splitSequence,
+  startupCommands,
 } from "./ZenPipes.sys.mjs";
 
 const lazy = {};
@@ -41,6 +49,7 @@ ChromeUtils.defineESModuleGetters(lazy, {
   formatAge: "resource:///modules/zen/archive/ZenTabArchiveModel.sys.mjs",
   SearchService: "moz-src:///toolkit/components/search/SearchService.sys.mjs",
   PlacesUtils: "resource://gre/modules/PlacesUtils.sys.mjs",
+  Subprocess: "resource://gre/modules/Subprocess.sys.mjs",
   ZenNativePlayers: "resource:///modules/zen/media/ZenNativePlayers.sys.mjs",
   describeTrack: "resource:///modules/zen/media/ZenNativePlayersModel.sys.mjs",
   searchURL: "resource:///modules/zen/media/ZenNativePlayersModel.sys.mjs",
@@ -61,6 +70,36 @@ function hideSecrets(line) {
   return line.replace(/^(\s*ai\s+key\s+)(?!-)\S+/, "$1••••••••");
 }
 const BLAME_KEY = "zen-blame";
+
+// Shared by every window: aliases, and whether the startup file has run
+// this session (it runs once, in the first window).
+const shell = {
+  aliases: new Map(),
+  startupStarted: false,
+  lastStartup: null, // {at, commands, failed}
+};
+
+/** The startup file: ~/.commitrc, or the zen.console.startup-file pref. */
+function startupPath() {
+  const pref = Services.prefs.getStringPref("zen.console.startup-file", "");
+  return pref || PathUtils.join(Services.dirsvc.get("Home", Ci.nsIFile).path, ".commitrc");
+}
+
+function shortPath(path) {
+  const home = Services.dirsvc.get("Home", Ci.nsIFile).path;
+  return path.startsWith(home + "/") ? "~" + path.slice(home.length) : path;
+}
+
+async function readStartup() {
+  try {
+    return await IOUtils.readUTF8(startupPath());
+  } catch (e) {
+    if (e.name === "NotFoundError") {
+      return null;
+    }
+    throw e;
+  }
+}
 
 function registerGrepActor() {
   try {
@@ -164,6 +203,10 @@ const HELP = [
     "bring back this space as it was: yesterday, \"last tuesday\", \"3 days ago\"",
   ],
   ["diff <time>", "what you opened and closed since then"],
+  ["", "Undo (bulk changes are saved first: pipes, tidy apply, checkout, stash, pull…):"],
+  ["undo [n]", "put back what the last change did (n: the last n changes)"],
+  ["redo", "reverse the last undo"],
+  ["reflog", "the changes undo can reverse"],
   ["", "Finding and moving tabs:"],
   ["grep [-a] <text>", "search the text of this space's tabs (-a: every space)"],
   ["go <n>", "jump to a result from grep (or click it)"],
@@ -197,6 +240,11 @@ const HELP = [
   ["ai location <city>", "where you are, for \"near me\" in do (only this text is sent)"],
   ["commit", "with no -m, Claude writes the message from what changed"],
   ['checkout "<description>"', "find a commit by meaning: checkout \"planning Tokyo\""],
+  ["", "Your own commands:"],
+  ["a && b  ·  a ; b", "run several: && stops at the first error, ; keeps going"],
+  ["alias [name='commands']", "list aliases, or save one: alias study='switch thesis && focus 50m'"],
+  ["unalias <name>", "remove an alias"],
+  ["startup [edit|run]", "~/.commitrc: commands Commit runs when it starts (aliases are saved there)"],
   ["", "Pipes (start with a list, filter it, end with an action):"],
   ["ls [-a] | …", "tabs in this space (-a: every space)"],
   ["history [today|yesterday|week|3d|all] [text]", ""],
@@ -231,6 +279,9 @@ export class ZenGitConsole extends ZenUIComponent {
   #grepResults = [];
   #topRows = [];
   #grepQuery = "";
+  #errors = 0; // error lines printed, so `a && b` knows if `a` failed
+  #step = ""; // the command running now, for the reflog
+  #inStartup = false;
 
   init() {
     this.addEventListener("keydown", { capture: true });
@@ -245,6 +296,13 @@ export class ZenGitConsole extends ZenUIComponent {
     ZenGitManager.scheduleRefresh(this.window);
     ZenGitManager.startTimeTravel();
     registerGrepActor();
+    if (
+      !shell.startupStarted &&
+      !this.window.PrivateBrowsingUtils?.isWindowPrivate(this.window)
+    ) {
+      shell.startupStarted = true;
+      this.#startupWhenReady();
+    }
   }
 
   uninit() {
@@ -351,7 +409,7 @@ export class ZenGitConsole extends ZenUIComponent {
     (doc.body || doc.documentElement).append(this.#panel);
   }
 
-  toggle(force) {
+  #ensurePanel() {
     if (!this.#panel) {
       this.#build();
       this.#print(
@@ -359,6 +417,10 @@ export class ZenGitConsole extends ZenUIComponent {
         "dim"
       );
     }
+  }
+
+  toggle(force) {
+    this.#ensurePanel();
     const show = force ?? this.#panel.hidden;
     this.#panel.hidden = !show;
     if (show) {
@@ -399,9 +461,9 @@ export class ZenGitConsole extends ZenUIComponent {
       case "Tab": {
         const value = this.#input.value;
         if (!value.includes(" ")) {
-          const match = Object.keys(this.#commands).filter(c =>
-            c.startsWith(value)
-          );
+          const match = [
+            ...new Set([...Object.keys(this.#commands), ...shell.aliases.keys()]),
+          ].filter(c => c.startsWith(value));
           if (match.length === 1) {
             this.#input.value = match[0] + " ";
           } else if (match.length > 1) {
@@ -417,6 +479,9 @@ export class ZenGitConsole extends ZenUIComponent {
   }
 
   #print(text, kind = "", onClick = null) {
+    if (kind === "error") {
+      this.#errors++;
+    }
     if (!this.#output) {
       return;
     }
@@ -474,22 +539,67 @@ export class ZenGitConsole extends ZenUIComponent {
   // ---------------------------------------------------------------------
   // Commands
 
+  /**
+   * Runs a line: one command, a pipe, or several joined by && and ;, with
+   * aliases expanded.
+   *
+   * @param {string} line
+   * @returns {Promise<boolean>} Whether the last command that ran worked.
+   */
   async run(line) {
     this.#print(`❯ ${hideSecrets(line)}`, "echo");
-    if (isPipeline(line)) {
-      await this.#pipe(line);
-      return;
+    const isCommand = name => name in this.#commands || shell.aliases.has(name);
+    let steps;
+    try {
+      steps = expandLine(line, shell.aliases, isCommand);
+    } catch (e) {
+      this.#print(e.message, "error");
+      return false;
     }
-    const [name, ...args] = tokenize(line);
-    if (!name) {
-      return;
+    const typed = splitSequence(line, isCommand).map(step => step.text);
+    if (
+      steps.length !== typed.length ||
+      steps.some((step, i) => step.text !== typed[i])
+    ) {
+      const joiner = step => (step.op === ";" ? "; " : " && ");
+      const shown = steps
+        .map((step, i) => (i ? joiner(step) : "") + step.text)
+        .join("");
+      this.#print(`→ ${hideSecrets(shown)}`, "dim");
     }
-    const command = this.#commands[name];
-    if (!command) {
-      this.#print(`${name}: command not found. Try \`help\`.`, "error");
-      return;
+    let ok = true;
+    for (const step of steps) {
+      if (step.op === "&&" && !ok) {
+        continue;
+      }
+      ok = await this.#runStep(step.text);
     }
-    await command.call(this, args, line);
+    return ok;
+  }
+
+  async #runStep(text) {
+    const errorsBefore = this.#errors;
+    this.#step = text;
+    try {
+      if (isPipeline(text)) {
+        await this.#pipe(text);
+      } else {
+        const [name, ...args] = tokenize(text);
+        if (!name) {
+          return true;
+        }
+        const command = this.#commands[name];
+        if (!command) {
+          this.#print(`${name}: command not found. Try \`help\`.`, "error");
+          return false;
+        }
+        await command.call(this, args, text);
+      }
+    } catch (e) {
+      this.#print(e.message || String(e), "error");
+      return false;
+    }
+    return this.#errors === errorsBefore;
   }
 
   get #commands() {
@@ -542,6 +652,12 @@ export class ZenGitConsole extends ZenUIComponent {
       prev: args => this.#skip("previous", args),
       setup: this.#clone,
       archive: this.#archive,
+      undo: this.#undo,
+      redo: this.#redo,
+      reflog: this.#reflog,
+      alias: this.#alias,
+      unalias: this.#unalias,
+      startup: this.#startup,
       debug: this.#debug,
       clear: () => this.#output.replaceChildren(),
       // `history` alone is what you typed here; `history today` (or
@@ -752,9 +868,11 @@ export class ZenGitConsole extends ZenUIComponent {
       return;
     }
     if (sub === "reset" || sub === "restore") {
-      const result = await ZenGitManager.resetEssentials(this.window, {
-        force: args.includes("-f"),
-      });
+      const result = await this.#undoable(
+        { spaces: [], essentials: true },
+        () => ZenGitManager.resetEssentials(this.window, { force: args.includes("-f") }),
+        done => (done.summary === "already matched" ? null : { summary: done.summary })
+      );
       this.#print("Essentials match their last commit again.", "added");
       this.#printResult(result);
       return;
@@ -851,17 +969,22 @@ export class ZenGitConsole extends ZenUIComponent {
       );
       return;
     }
-    for (const { before } of targets) {
-      const tab = this.document.getElementById(before.id);
-      if (!tab) {
-        continue;
+    await this.#undoable({}, () => {
+      let restored = 0;
+      for (const { before } of targets) {
+        const tab = this.document.getElementById(before.id);
+        if (!tab) {
+          continue;
+        }
+        tab.linkedBrowser.fixupAndLoadURIString(before.url, {
+          triggeringPrincipal:
+            Services.scriptSecurityManager.getSystemPrincipal(),
+        });
+        this.#print(`restored ${before.title}`, "dim");
+        restored++;
       }
-      tab.linkedBrowser.fixupAndLoadURIString(before.url, {
-        triggeringPrincipal:
-          Services.scriptSecurityManager.getSystemPrincipal(),
-      });
-      this.#print(`restored ${before.title}`, "dim");
-    }
+      return restored ? { summary: `sent ${restored} tab${restored == 1 ? "" : "s"} back to their committed URL` } : null;
+    });
   }
 
   async #push(args) {
@@ -887,7 +1010,11 @@ export class ZenGitConsole extends ZenUIComponent {
       );
       return;
     }
-    const { lines } = await ZenGitManager.pullAll(this.window);
+    const { lines } = await this.#undoable(
+      { spaces: "all" },
+      () => ZenGitManager.pullAll(this.window),
+      this.#ifChanged("pulled every space")
+    );
     for (const { text, kind } of lines) {
       this.#print(text, kind);
     }
@@ -897,7 +1024,7 @@ export class ZenGitConsole extends ZenUIComponent {
    * Arc-style auto-archive (src/zen/archive): shows which tabs will close,
    * runs it now, or changes when it happens.
    */
-  #archive(args) {
+  async #archive(args) {
     const { ZenTabArchiver } = lazy;
     const archiver = ZenTabArchiver.forWindow(this.window);
     if (!archiver) {
@@ -907,7 +1034,11 @@ export class ZenGitConsole extends ZenUIComponent {
     const [sub, value] = args;
     switch (sub) {
       case "now": {
-        const count = archiver.archiveStaleTabs({ force: true });
+        const count = await this.#undoable(
+          { spaces: "all" },
+          () => archiver.archiveStaleTabs({ force: true }),
+          n => (n ? { summary: `archived ${n} tab${n === 1 ? "" : "s"}` } : null)
+        );
         this.#print(
           count
             ? `Archived ${count} tab${count === 1 ? "" : "s"}. ` +
@@ -1227,7 +1358,14 @@ export class ZenGitConsole extends ZenUIComponent {
       this.#print(`Nothing in ${label} matches ${selectors.join(" ")}.`, "error");
       return;
     }
-    const { opened, skipped } = await ZenGitManager.cherryPick(this.window, picked);
+    const { opened, skipped } = await this.#undoable(
+      {},
+      () => ZenGitManager.cherryPick(this.window, picked),
+      done =>
+        done.opened.length
+          ? { summary: `copied ${done.opened.length} tab${done.opened.length == 1 ? "" : "s"} here` }
+          : null
+    );
     for (const tab of opened) {
       this.#print(`+ ${tab.title}`, "added");
     }
@@ -1969,6 +2107,29 @@ export class ZenGitConsole extends ZenUIComponent {
     }
     this.#tidyPlan = null;
     const { plan, items } = saved;
+    const targets = plan.move
+      .map(({ space }) => spaces.find(s => s.name == space)?.uuid)
+      .filter(Boolean);
+    const counts = await this.#undoable(
+      { spaces: [active, ...targets] },
+      () => this.#doTidy(plan, items, active, spaces),
+      done => {
+        const parts = [
+          done.folders && `made ${done.folders} folder${done.folders == 1 ? "" : "s"}`,
+          done.moved && `moved ${done.moved}`,
+          done.closed && `closed ${done.closed}`,
+        ].filter(Boolean);
+        return parts.length ? { summary: parts.join(", ") } : null;
+      }
+    );
+    this.#print(
+      `Made ${counts.folders} folder${counts.folders == 1 ? "" : "s"}, moved ${counts.moved} tab${counts.moved == 1 ? "" : "s"}, closed ${counts.closed}. ` +
+        "`undo` puts it back.",
+      "added"
+    );
+  }
+
+  #doTidy(plan, items, active, spaces) {
     const live = index => {
       const tab = items[index]?.ref;
       return tab?.isConnected && !tab.closing ? tab : null;
@@ -1998,11 +2159,7 @@ export class ZenGitConsole extends ZenUIComponent {
       this.window.gBrowser.removeTabs(closing);
       counts.closed = closing.length;
     }
-    this.#print(
-      `Made ${counts.folders} folder${counts.folders == 1 ? "" : "s"}, moved ${counts.moved} tab${counts.moved == 1 ? "" : "s"}, closed ${counts.closed}. ` +
-        "`checkout` or time travel brings anything back.",
-      "added"
-    );
+    return counts;
   }
 
   async #catchUp() {
@@ -2075,6 +2232,285 @@ export class ZenGitConsole extends ZenUIComponent {
       this.window.setTimeout(() => (this.#consoleOpening = null), 0);
     }
     this.#print(`Opened ${Math.min(12, this.#doSources.length)} sources in the space "${name}".`, "added");
+  }
+
+  // ---------------------------------------------------------------------
+  // Undo and the reflog
+
+  /**
+   * Runs a command that changes many tabs, saving the spaces it touches
+   * first so `undo` can put them back.
+   *
+   * @param {object} scope For ZenGitManager.undoPoint: {spaces, essentials, branch}.
+   * @param {Function} work Does the change; returns a value for the caller.
+   * @param {Function} [describe] (value, point) -> {summary, note} for the
+   *   reflog, or null when nothing changed.
+   */
+  async #undoable(scope, work, describe = value => (value?.summary ? { summary: value.summary } : null)) {
+    let point = null;
+    try {
+      point = await ZenGitManager.undoPoint(this.window, scope);
+    } catch (e) {
+      console.warn("Commit: could not save an undo point:", e);
+    }
+    const value = await work();
+    if (point) {
+      try {
+        const details = await describe(value, point);
+        if (details?.summary) {
+          await ZenGitManager.recordUndo(point, { label: this.#step, ...details });
+        }
+      } catch (e) {
+        console.warn("Commit: could not save to the reflog:", e);
+      }
+    }
+    return value;
+  }
+
+  // For commands that may or may not change anything (pull, clone).
+  #ifChanged(summary) {
+    return async (_value, point) =>
+      (await ZenGitManager.layoutChanged(this.window, point)) ? { summary } : null;
+  }
+
+  async #undo(args) {
+    const count = args.length ? Number.parseInt(args[0], 10) : 1;
+    if (!(count > 0)) {
+      this.#print("usage: undo [n]   (n: how many of the newest changes)", "error");
+      return;
+    }
+    const result = await ZenGitManager.undo(this.window, count);
+    if (!result) {
+      this.#print("Nothing to undo. `reflog` lists the changes Commit saved.", "dim");
+      return;
+    }
+    for (const entry of result.undone) {
+      this.#print(`Undid ${entry.label} (${entry.summary})`, "added");
+    }
+    this.#printResult(result);
+    for (const line of result.switched) {
+      this.#print(line, "dim");
+    }
+    for (const entry of result.undone) {
+      if (entry.note) {
+        this.#print(entry.note, "dim");
+      }
+    }
+    this.#print("`redo` puts it back.", "dim");
+  }
+
+  async #redo() {
+    const result = await ZenGitManager.redo(this.window);
+    if (!result) {
+      this.#print("Nothing to redo.", "dim");
+      return;
+    }
+    for (const entry of result.redone) {
+      this.#print(`Redid ${entry.label} (${entry.summary})`, "added");
+    }
+    this.#printResult(result);
+    for (const line of result.switched) {
+      this.#print(line, "dim");
+    }
+  }
+
+  async #reflog(args) {
+    const count = Number.parseInt(args[0], 10) || 20;
+    const log = await ZenGitManager.reflog();
+    if (!log.length) {
+      this.#print(
+        "Nothing saved yet. Commands that change many tabs at once (pipes that close, move or open tabs, " +
+          "tidy apply, checkout, stash, cherry-pick, pull, archive now) are saved here first, and `undo` reverses them.",
+        "dim"
+      );
+      return;
+    }
+    const clip = (text, width) =>
+      text.length > width ? text.slice(0, width - 1) + "…" : text.padEnd(width);
+    for (const entry of log.slice(0, count)) {
+      const where = entry.names?.length ? `  [${entry.names.join(", ")}]` : "";
+      let state = "";
+      if (entry.undone) {
+        state = "  (undone)";
+      } else if (entry.kind === "undo" && entry.redone) {
+        state = "  (redone)";
+      }
+      const what =
+        entry.kind === "change" ? entry.summary : `${entry.kind}: ${entry.summary}`;
+      this.#print(
+        `${relativeTime(entry.at).padEnd(12)} ${clip(entry.label, 34)} ${what}${where}${state}`,
+        entry.undone || entry.kind !== "change" ? "dim" : ""
+      );
+    }
+    this.#print(
+      "`undo` reverses the newest change that isn't undone (`undo 3`: the newest three); `redo` reverses an undo.",
+      "dim"
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Aliases and the startup file (~/.commitrc)
+
+  async #alias(args, line) {
+    const rest = line.replace(/^\s*alias\b/, "");
+    if (!rest.trim()) {
+      if (!shell.aliases.size) {
+        this.#print(
+          "No aliases yet. e.g. alias study='switch thesis && focus 50m && play music lofi'",
+          "dim"
+        );
+        return;
+      }
+      for (const [name, body] of [...shell.aliases].sort(([a], [b]) => a.localeCompare(b))) {
+        this.#print(formatAlias(name, body));
+      }
+      this.#print(`Saved in ${shortPath(startupPath())}.`, "dim");
+      return;
+    }
+    const { name, body } = parseAliasDefinition(rest);
+    if (body === null) {
+      if (shell.aliases.has(name)) {
+        this.#print(formatAlias(name, shell.aliases.get(name)));
+      } else {
+        this.#print(`alias: ${name} not found`, "error");
+      }
+      return;
+    }
+    shell.aliases.set(name, body);
+    if (this.#inStartup) {
+      return;
+    }
+    const text = (await readStartup()) ?? STARTUP_TEMPLATE;
+    await IOUtils.writeUTF8(startupPath(), setAliasInText(text, name, body), {
+      tmpPath: startupPath() + ".tmp",
+    });
+    this.#print(`${name} → ${body}`, "added");
+    const replaces = name in this.#commands;
+    this.#print(
+      `Saved in ${shortPath(startupPath())}.` +
+        (replaces ? ` It replaces the built-in \`${name}\` (\`unalias ${name}\` brings that back).` : ""),
+      "dim"
+    );
+  }
+
+  async #unalias(args) {
+    const [name] = args;
+    if (!name) {
+      this.#print("usage: unalias <name>", "error");
+      return;
+    }
+    const had = shell.aliases.delete(name);
+    const text = await readStartup();
+    const { text: next, removed } = removeAliasFromText(text ?? "", name);
+    if (removed) {
+      await IOUtils.writeUTF8(startupPath(), next, { tmpPath: startupPath() + ".tmp" });
+    }
+    if (!had && !removed) {
+      this.#print(`unalias: ${name} not found`, "error");
+      return;
+    }
+    this.#print(`Removed ${name}.`, "deleted");
+  }
+
+  async #startup(args) {
+    const [sub] = args;
+    const path = startupPath();
+    const shown = shortPath(path);
+    if (sub === "run") {
+      await this.#runStartup({ manual: true });
+      return;
+    }
+    if (sub === "edit") {
+      if ((await readStartup()) === null) {
+        await IOUtils.writeUTF8(path, STARTUP_TEMPLATE);
+      }
+      const proc = await lazy.Subprocess.call({
+        command: "/usr/bin/open",
+        arguments: ["-t", path],
+        stderr: "stdout",
+      });
+      proc.stdin.close();
+      const { exitCode } = await proc.wait();
+      if (exitCode) {
+        this.#print(`Couldn't open ${shown}. Edit it in any text editor.`, "error");
+        return;
+      }
+      this.#print(`Opened ${shown}. After saving, \`startup run\` runs it again.`, "added");
+      return;
+    }
+    if (sub) {
+      this.#print("usage: startup [edit | run]", "error");
+      return;
+    }
+    const text = await readStartup();
+    if (text === null) {
+      this.#print(
+        `No startup file yet. \`startup edit\` makes ${shown}; Commit runs its commands each time it starts, and \`alias\` saves aliases there.`,
+        "dim"
+      );
+      return;
+    }
+    this.#print(`${shown} (runs when Commit starts):`, "dim");
+    for (const line of text.replace(/\n+$/, "").split("\n")) {
+      this.#print(line, line.trim().startsWith("#") ? "dim" : "");
+    }
+    const last = shell.lastStartup;
+    if (last) {
+      this.#print(
+        `Last ran ${relativeTime(last.at)}: ${last.commands} command${last.commands === 1 ? "" : "s"}` +
+          (last.failed ? `, ${last.failed} failed` : "") +
+          ". `startup edit` opens it; `startup run` runs it again.",
+        last.failed ? "modified" : "dim"
+      );
+    }
+  }
+
+  async #startupWhenReady() {
+    try {
+      await this.window.gZenWorkspaces.promiseInitialized;
+      await lazy.SessionStore.promiseAllWindowsRestored;
+      if (!this.window.closed) {
+        await this.#runStartup();
+      }
+    } catch (e) {
+      console.error("Commit: startup file:", e);
+    }
+  }
+
+  async #runStartup({ manual = false } = {}) {
+    const text = await readStartup();
+    const shown = shortPath(startupPath());
+    if (text === null) {
+      if (manual) {
+        this.#print(`No startup file yet. \`startup edit\` makes ${shown}.`, "dim");
+      }
+      return;
+    }
+    const commands = startupCommands(text);
+    this.#ensurePanel();
+    this.#print(`Running ${shown}…`, "dim");
+    // Aliases come from the file, so ones removed from it go away.
+    shell.aliases.clear();
+    let failed = 0;
+    this.#inStartup = true;
+    try {
+      for (const { line, text: command } of commands) {
+        if (!(await this.run(command))) {
+          failed++;
+          this.#print(`(line ${line} of ${shown})`, "dim");
+        }
+      }
+    } finally {
+      this.#inStartup = false;
+    }
+    shell.lastStartup = { at: Date.now(), commands: commands.length, failed };
+    if (manual || failed) {
+      this.#print(
+        `Ran ${commands.length} command${commands.length === 1 ? "" : "s"} from ${shown}` +
+          (failed ? `; ${failed} failed.` : "."),
+        failed ? "modified" : "dim"
+      );
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -2237,14 +2673,17 @@ export class ZenGitConsole extends ZenUIComponent {
         if (this.#needsForce("open", list, args, line)) {
           return;
         }
-        this.#consoleOpening = line;
-        try {
-          for (const item of list) {
-            this.window.openTrustedLinkIn(item.url, "tab", { inBackground: true });
+        await this.#undoable({}, () => {
+          this.#consoleOpening = line;
+          try {
+            for (const item of list) {
+              this.window.openTrustedLinkIn(item.url, "tab", { inBackground: true });
+            }
+          } finally {
+            this.window.setTimeout(() => (this.#consoleOpening = null), 0);
           }
-        } finally {
-          this.window.setTimeout(() => (this.#consoleOpening = null), 0);
-        }
+          return list.length ? { summary: `opened ${plural(list.length, "tab")}` } : null;
+        });
         this.#print(`Opened ${plural(list.length, "tab")} in the background.`, "added");
         return;
       }
@@ -2256,10 +2695,22 @@ export class ZenGitConsole extends ZenUIComponent {
         if (this.#needsForce("close", list, args, line)) {
           return;
         }
-        this.window.gBrowser.removeTabs(list.map(item => item.ref));
+        await this.#undoable(
+          {
+            spaces: list
+              .filter(item => !item.essential)
+              .map(item => item.ref.getAttribute("zen-workspace-id")),
+            essentials: list.some(item => item.essential),
+          },
+          () => {
+            this.window.gBrowser.removeTabs(list.map(item => item.ref));
+            return list.length ? { summary: `closed ${plural(list.length, "tab")}` } : null;
+          }
+        );
         this.#print(
           `Closed ${plural(list.length, "tab")}.` +
-            (kept ? ` Kept ${plural(kept, "Essential")} (close -f closes those too).` : ""),
+            (kept ? ` Kept ${plural(kept, "Essential")} (close -f closes those too).` : "") +
+            (list.length ? " `undo` brings them back." : ""),
           list.length ? "deleted" : "dim"
         );
         return;
@@ -2290,9 +2741,22 @@ export class ZenGitConsole extends ZenUIComponent {
         if (this.#needsForce(`move to ${space.name}`, list, args, line)) {
           return;
         }
-        this.window.gZenWorkspaces.moveTabsToWorkspace(
-          list.map(item => item.ref),
-          space.uuid
+        await this.#undoable(
+          {
+            spaces: [
+              ...list.map(item => item.ref.getAttribute("zen-workspace-id")),
+              space.uuid,
+            ],
+          },
+          () => {
+            this.window.gZenWorkspaces.moveTabsToWorkspace(
+              list.map(item => item.ref),
+              space.uuid
+            );
+            return list.length
+              ? { summary: `moved ${plural(list.length, "tab")} to ${space.name}` }
+              : null;
+          }
         );
         this.#print(`Moved ${plural(list.length, "tab")} to ${space.name}.`, "added");
         return;
@@ -2348,10 +2812,11 @@ export class ZenGitConsole extends ZenUIComponent {
       }
     }
     this.#print("Getting Essentials and every space's default branch…", "dim");
-    const { lines } = await ZenGitManager.pullAll(this.window, {
-      setup: true,
-      force,
-    });
+    const { lines } = await this.#undoable(
+      { spaces: "all" },
+      () => ZenGitManager.pullAll(this.window, { setup: true, force }),
+      this.#ifChanged("loaded every space's default branch")
+    );
     for (const { text, kind } of lines) {
       this.#print(text, kind);
     }
@@ -2443,7 +2908,11 @@ export class ZenGitConsole extends ZenUIComponent {
       }
       rest.splice(0, rest.length, found);
     } else if (!isRev && looksLikeTime(when)) {
-      const travelled = await ZenGitManager.travel(this.window, when, { force });
+      const travelled = await this.#undoable(
+        {},
+        () => ZenGitManager.travel(this.window, when, { force }),
+        done => (done.summary === "already matched" ? null : { summary: done.summary })
+      );
       this.#print(
         `${travelled.space.name} is back the way it was on ${travelled.date}. ` +
           "`commit` keeps it, `checkout -f <branch>` goes back.",
@@ -2452,9 +2921,17 @@ export class ZenGitConsole extends ZenUIComponent {
       this.#printResult(travelled);
       return;
     }
-    const result = await ZenGitManager.checkout(this.window, rest[0], {
-      force,
-    });
+    const result = await this.#undoable(
+      { branch: true },
+      () => ZenGitManager.checkout(this.window, rest[0], { force }),
+      done => {
+        if (done.summary !== "already matched") {
+          return { summary: done.summary };
+        }
+        // Same tabs, but the branch changed: undo switches it back.
+        return done.kind === "branch" ? { summary: `switched to '${rest[0]}'` } : null;
+      }
+    );
     if (result.kind === "branch") {
       this.#print(`Switched to branch '${rest[0]}'`, "added");
       if (result.summary === "already matched") {
@@ -2496,10 +2973,14 @@ export class ZenGitConsole extends ZenUIComponent {
       case "apply": {
         const force = rest.includes("-f");
         const ref = rest.find(a => a !== "-f") || null;
-        const result = await ZenGitManager.stashPop(this.window, {
-          force,
-          ref,
-        });
+        const result = await this.#undoable(
+          {},
+          () => ZenGitManager.stashPop(this.window, { force, ref }),
+          done => ({
+            summary: done.summary,
+            note: "Those tabs are no longer stashed either: `redo` brings them back.",
+          })
+        );
         this.#print(`Restored stashed tabs${ref ? ` (${ref})` : ""}`, "added");
         this.#printResult(result);
         return;
@@ -2533,7 +3014,15 @@ export class ZenGitConsole extends ZenUIComponent {
         const { message } = extractMessage(
           sub === "push" || sub === "save" ? rest : args
         );
-        const result = await ZenGitManager.stash(this.window, message);
+        const result = await this.#undoable(
+          {},
+          () => ZenGitManager.stash(this.window, message),
+          done =>
+            done && {
+              summary: `stashed: ${done.summary}`,
+              note: "The stash is still saved too: `stash drop` removes it.",
+            }
+        );
         if (!result) {
           this.#print("No local changes to stash.", "dim");
           return;

@@ -1304,3 +1304,208 @@ export function processRows(before, after, elapsedMs, tabsByPid, { sortBy = "mem
   rows.push(own);
   return { rows, total };
 }
+
+// ---------------------------------------------------------------------------
+// Undo and the reflog
+//
+// Before a command changes many tabs at once (a pipe that closes or moves
+// tabs, `tidy apply`, `checkout`, `stash`, `pull`...), the console saves the
+// spaces it touches. `undo` puts them back with the same code `checkout`
+// uses, and `reflog` lists what was saved. The log is newest first.
+
+/** How many changes the reflog keeps. */
+export const UNDO_LIMIT = 30;
+
+/**
+ * The part of a snapshot that a change touches.
+ *
+ * @param {object} snapshot
+ * @param {{spaceIds: string[], essentials: boolean}} scope
+ * @returns {object} A snapshot with only those spaces (and Essentials).
+ */
+export function layoutPart(snapshot, scope) {
+  const ids = new Set(scope?.spaceIds || []);
+  return {
+    version: snapshot?.version ?? SNAPSHOT_VERSION,
+    essentials: scope?.essentials ? [...(snapshot?.essentials || [])] : [],
+    spaces: (snapshot?.spaces || []).filter(space => ids.has(space.id)),
+  };
+}
+
+/**
+ * The scope for every space in a snapshot and Essentials.
+ *
+ * @param {object} snapshot
+ * @returns {{spaceIds: string[], essentials: boolean}}
+ */
+export function wholeScope(snapshot) {
+  return {
+    spaceIds: (snapshot?.spaces || []).map(space => space.id),
+    essentials: true,
+  };
+}
+
+/**
+ * Builds a reflog entry for a change.
+ *
+ * @param {object} options
+ * @param {string} options.id
+ * @param {number} options.at When it happened (ms).
+ * @param {"change"|"undo"|"redo"} [options.kind]
+ * @param {string} options.label What was typed, e.g. "ls -a | grep x | close".
+ * @param {string} options.summary What it did, e.g. "closed 14 tabs".
+ * @param {object} options.point From the manager's undoPoint():
+ *   {scope, before, branches, names}.
+ * @param {string|null} [options.note] Shown after undoing it.
+ * @param {string[]} [options.undoes] For an undo: the ids it reversed.
+ * @returns {object}
+ */
+export function undoEntry({
+  id,
+  at,
+  kind = "change",
+  label,
+  summary,
+  point,
+  note = null,
+  undoes = [],
+}) {
+  return {
+    id,
+    at,
+    kind,
+    label,
+    summary,
+    note,
+    names: point.names || [],
+    scope: {
+      spaceIds: [...(point.scope?.spaceIds || [])],
+      essentials: !!point.scope?.essentials,
+    },
+    before: point.before,
+    branches: { ...(point.branches || {}) },
+    undoes,
+    undone: false,
+    redone: false,
+  };
+}
+
+/**
+ * @param {object[]} log Newest first.
+ * @param {object} entry
+ * @param {number} [limit]
+ * @returns {object[]} The log with the entry added, oldest ones dropped.
+ */
+export function addToLog(log, entry, limit = UNDO_LIMIT) {
+  return [entry, ...(log || [])].slice(0, limit);
+}
+
+/**
+ * The changes `undo [count]` reverses: the newest ones not undone yet.
+ * Undos and redos are skipped; `redo` handles those.
+ *
+ * @param {object[]} log Newest first.
+ * @param {number} [count]
+ * @returns {object[]} Newest first.
+ */
+export function pickUndo(log, count = 1) {
+  return (log || [])
+    .filter(entry => entry.kind === "change" && !entry.undone)
+    .slice(0, Math.max(1, count));
+}
+
+/**
+ * The undo that `redo` reverses: the newest one not redone yet, as long as
+ * no new change happened after it (a new change ends the redo chain, like
+ * in any editor).
+ *
+ * @param {object[]} log Newest first.
+ * @returns {object|null}
+ */
+export function pickRedo(log) {
+  for (const entry of log || []) {
+    if (entry.kind === "redo" || (entry.kind === "undo" && entry.redone)) {
+      continue;
+    }
+    return entry.kind === "undo" ? entry : null;
+  }
+  return null;
+}
+
+/**
+ * What undoing several changes at once restores: for each space (and
+ * Essentials), the layout from before the oldest of them that touched it.
+ *
+ * @param {object[]} entries Newest first, from pickUndo().
+ * @returns {{scope: {spaceIds: string[], essentials: boolean}, target: object, branches: object}}
+ */
+export function combineUndo(entries) {
+  const spaces = new Map(); // id -> the space as it was, or null if it didn't exist
+  const branches = {};
+  let essentials = null;
+  for (const entry of entries) {
+    // Older entries come later and overwrite newer ones.
+    for (const id of entry.scope.spaceIds) {
+      spaces.set(id, entry.before.spaces.find(space => space.id === id) || null);
+      if (entry.branches?.[id]) {
+        branches[id] = entry.branches[id];
+      }
+    }
+    if (entry.scope.essentials) {
+      essentials = entry.before.essentials || [];
+    }
+  }
+  return {
+    scope: { spaceIds: [...spaces.keys()], essentials: essentials !== null },
+    target: {
+      version: SNAPSHOT_VERSION,
+      essentials: essentials || [],
+      spaces: [...spaces.values()].filter(Boolean),
+    },
+    branches,
+  };
+}
+
+/**
+ * @param {object[]} log
+ * @param {string[]} ids
+ * @param {object} changes Fields to set on those entries.
+ * @returns {object[]} A new log.
+ */
+export function updateEntries(log, ids, changes) {
+  const wanted = new Set(ids);
+  return (log || []).map(entry =>
+    wanted.has(entry.id) ? { ...entry, ...changes } : entry
+  );
+}
+
+/**
+ * @param {ReturnType<typeof planCheckout>} plan From what is open now to
+ *   what a change restores.
+ * @returns {string} e.g. "reopened 14 tabs, moved 2".
+ */
+export function describeRestore(plan) {
+  const parts = [];
+  const tabs = n => `${n} tab${n === 1 ? "" : "s"}`;
+  if (plan.open.length) {
+    parts.push(`reopened ${tabs(plan.open.length)}`);
+  }
+  if (plan.close.length) {
+    parts.push(`closed ${tabs(plan.close.length)}`);
+  }
+  const moved = plan.update.filter(u => u.changes.some(c => c !== "url"));
+  if (moved.length) {
+    parts.push(`moved ${tabs(moved.length)}`);
+  }
+  const navigated = plan.update.length - moved.length;
+  if (navigated) {
+    parts.push(`sent ${tabs(navigated)} back to their old page`);
+  }
+  if (plan.createSpaces.length) {
+    parts.push(`brought back ${plan.createSpaces.length} space(s)`);
+  }
+  if (plan.createFolders.length) {
+    parts.push(`brought back ${plan.createFolders.length} folder(s)`);
+  }
+  return parts.join(", ") || "nothing needed to change";
+}

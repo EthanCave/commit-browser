@@ -37,6 +37,7 @@ Found 3f2a91c (3 weeks ago): Planning Tokyo trip: flights and two hotels
 - `push` / `pull` / `clone` sync every space and your Essentials through a GitHub repo, so a new computer gets your whole setup with one command.
 - Time travel: an hourly snapshot of every space. `checkout yesterday`, `diff "last tuesday"`, `timeline`.
 - Status dots on tabs show what changed since the last commit.
+- `undo` reverses the last change that touched many tabs at once (a pipe that closed or moved tabs, `tidy apply`, `checkout`, `stash`, `pull`…); `redo` and `reflog` too.
 
 **A console (Ctrl+\`)**
 - `cd github`, `open gh/owner/repo`, `g <search>`, `ls`, `pwd`: navigate by typing; `cd` remembers sites from your history.
@@ -44,6 +45,7 @@ Found 3f2a91c (3 weeks ago): Planning Tokyo trip: flights and two hotels
 - `share` / `import` a space as a secret gist or a code.
 - `focus 25m` blocks distracting sites and keeps you in one space.
 - `top`, `unload`, `gc`: memory and CPU by site, and putting background tabs to sleep.
+- Run several commands with `&&` and `;`, save your own with `alias study='switch thesis && focus 50m'`, and put commands to run at every start in `~/.commitrc` (`startup edit`).
 - Pipes over tabs and history:
   `history week | grep -v youtube | ai "COMP 215" | open`
   Lists: `ls [-a]`, `history <when>` · filters: `grep`, `head`, `tail`, `sort`, `uniq`, `ai` · actions: `close`, `sleep`, `mv <space>`, `open`, `copy`, `wc`.

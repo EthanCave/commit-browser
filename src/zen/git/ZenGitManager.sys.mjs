@@ -16,6 +16,15 @@ import {
   computeStatus,
   essentialsSnapshot,
   isClean,
+  addToLog,
+  combineUndo,
+  describeRestore,
+  layoutPart,
+  pickRedo,
+  pickUndo,
+  undoEntry,
+  updateEntries,
+  wholeScope,
   looksLikeTime,
   mergeStatuses,
   selectTabs,
@@ -96,6 +105,55 @@ const ioFs = {
     );
   },
 };
+
+/**
+ * Opens a tab that loads only when it is first selected, labelled with its
+ * saved title. Zen ignores label changes on tabs that haven't been shown
+ * unless _zenChangeLabelFlag is set, and the lazy tab's session state needs
+ * the title too, or the label goes back to "New Tab".
+ *
+ * @param {object} gBrowser
+ * @param {string} url
+ * @param {string} title
+ * @param {nsIPrincipal} principal
+ * @returns {MozTabbrowserTab}
+ */
+function addLazyTab(gBrowser, url, title, principal) {
+  const tab = gBrowser.addTab(url, {
+    triggeringPrincipal: principal,
+    createLazyBrowser: true,
+    lazyTabTitle: title,
+    skipAnimation: true,
+    inBackground: true,
+  });
+  if (title && title !== url) {
+    tab._zenChangeLabelFlag = true;
+    try {
+      gBrowser.setInitialTabTitle(tab, title, { isContentTitle: true });
+    } catch {
+      /* the URL stays as the title until the tab loads */
+    } finally {
+      delete tab._zenChangeLabelFlag;
+    }
+  }
+  return tab;
+}
+
+/**
+ * Puts a tab in a space. A tab added just now already sits in the active
+ * space's list without saying so, and moveTabToWorkspace skips tabs that are
+ * already in the list, so the space is also set directly.
+ *
+ * @param {object} gZenWorkspaces
+ * @param {MozTabbrowserTab} tab
+ * @param {string} spaceId
+ */
+function moveToSpace(gZenWorkspaces, tab, spaceId) {
+  gZenWorkspaces.moveTabToWorkspace(tab, spaceId);
+  if (tab.getAttribute("zen-workspace-id") !== spaceId) {
+    tab.setAttribute("zen-workspace-id", spaceId);
+  }
+}
 
 class nsZenGitManager {
   #repo = null;
@@ -210,6 +268,9 @@ class nsZenGitManager {
   collectSidebar(window) {
     const tabs = [];
     for (const tab of window.gZenWorkspaces.allStoredTabs) {
+      if (tab.closing) {
+        continue; // Still animating out.
+      }
       let tabData = {};
       try {
         tabData = JSON.parse(lazy.SessionStore.getTabState(tab));
@@ -220,6 +281,12 @@ class nsZenGitManager {
       // Pending (not yet loaded) tabs report about:blank; keep the stored entry.
       if (liveUrl && liveUrl !== "about:blank") {
         tabData.entries = [{ url: liveUrl, title: tab.label }];
+        tabData.index = 1;
+      } else if (!tabData.entries?.length && tab.linkedBrowser?.userTypedValue) {
+        // A tab that just opened: the URL it is loading.
+        tabData.entries = [
+          { url: tab.linkedBrowser.userTypedValue, title: tab.label },
+        ];
         tabData.index = 1;
       }
       tabs.push({
@@ -792,23 +859,14 @@ class nsZenGitManager {
     for (const tabInfo of plan.open) {
       let tab = document.getElementById(tabInfo.id);
       if (tab) {
-        // Open but left out of snapshots (e.g. on an ignored site).
-        this.#navigate(tab, tabInfo.url, principal);
-      } else {
-        tab = gBrowser.addTab(tabInfo.url, {
-          triggeringPrincipal: principal,
-          createLazyBrowser: true,
-          skipAnimation: true,
-          inBackground: true,
-        });
-        tab.setAttribute("id", tabInfo.id);
-        try {
-          gBrowser.setInitialTabTitle(tab, tabInfo.title, {
-            isContentTitle: true,
-          });
-        } catch {
-          /* the URL stays as the title until the tab loads */
+        // Open but left out of this snapshot: on an ignored site, or (when
+        // undoing) moved to a space the undo doesn't cover.
+        if (tab.linkedBrowser?.currentURI?.spec !== tabInfo.url) {
+          this.#navigate(tab, tabInfo.url, principal);
         }
+      } else {
+        tab = addLazyTab(gBrowser, tabInfo.url, tabInfo.title, principal);
+        tab.setAttribute("id", tabInfo.id);
       }
       this.#place(window, tab, tabInfo, spaceFor, warnings);
     }
@@ -883,7 +941,7 @@ class nsZenGitManager {
         gBrowser.unpinTab(tab);
       }
 
-      gZenWorkspaces.moveTabToWorkspace(tab, spaceFor(info.spaceId));
+      moveToSpace(gZenWorkspaces, tab, spaceFor(info.spaceId));
       if (folder?.isZenFolder && tab.group !== folder) {
         folder.addTabs([tab]);
       }
@@ -1296,6 +1354,285 @@ class nsZenGitManager {
   }
 
   // -------------------------------------------------------------------------
+  // Undo and the reflog (the log lives in the profile, not the layouts repo,
+  // so it works without git and is never pushed)
+
+  #undoLog = null;
+
+  get #undoFile() {
+    return PathUtils.join(PathUtils.profileDir, "zen-git-undo.json");
+  }
+
+  async #readUndoLog() {
+    if (!this.#undoLog) {
+      try {
+        const data = JSON.parse(await ioFs.read(this.#undoFile));
+        this.#undoLog = Array.isArray(data?.entries) ? data.entries : [];
+      } catch {
+        this.#undoLog = [];
+      }
+    }
+    return this.#undoLog;
+  }
+
+  async #writeUndoLog(log) {
+    // Keep the file small: drop the oldest changes past ~2 MB.
+    let text = JSON.stringify({ version: 1, entries: log });
+    while (text.length > 2_000_000 && log.length > 5) {
+      log = log.slice(0, -1);
+      text = JSON.stringify({ version: 1, entries: log });
+    }
+    this.#undoLog = log;
+    await ioFs.write(this.#undoFile, text);
+  }
+
+  #undoId() {
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  async #branchesFor(window, spaceIds) {
+    const branches = {};
+    for (const space of window.gZenWorkspaces.getWorkspaces()) {
+      if (!spaceIds.includes(space.uuid)) {
+        continue;
+      }
+      try {
+        const { repo } = await this.#spaceRepo(space);
+        const branch = await repo.currentBranch();
+        if (branch) {
+          branches[space.uuid] = branch;
+        }
+      } catch {
+        /* no git, or no commits yet: tabs only */
+      }
+    }
+    return branches;
+  }
+
+  /**
+   * Saves the spaces a command is about to change, so `undo` can put them
+   * back. Pass the result to recordUndo() once the command has done
+   * something.
+   *
+   * @param {Window} window
+   * @param {object} options
+   * @param {string[]|"all"} [options.spaces] Space ids, "all", or (by
+   *   default) the active space.
+   * @param {boolean} [options.essentials]
+   * @param {boolean} [options.branch] Also save the active space's branch,
+   *   for commands that switch it.
+   * @returns {Promise<object>}
+   */
+  async undoPoint(window, { spaces = null, essentials = false, branch = false } = {}) {
+    const full = await this.currentSnapshot(window);
+    const scope =
+      spaces === "all"
+        ? wholeScope(full)
+        : {
+            spaceIds: [
+              ...new Set(spaces || [this.activeSpace(window).uuid]),
+            ].filter(Boolean),
+            essentials,
+          };
+    const names = full.spaces
+      .filter(space => scope.spaceIds.includes(space.id))
+      .map(space => space.name);
+    if (scope.essentials) {
+      names.push("Essentials");
+    }
+    const branches = branch
+      ? await this.#serialize(() =>
+          this.#branchesFor(window, [this.activeSpace(window).uuid])
+        )
+      : {};
+    return { scope, before: layoutPart(full, scope), branches, names };
+  }
+
+  /**
+   * Whether the spaces an undo point saved look different now (for
+   * commands like `pull` that may or may not change anything).
+   *
+   * @param {Window} window
+   * @param {object} point From undoPoint().
+   * @returns {Promise<boolean>}
+   */
+  async layoutChanged(window, point) {
+    const now = layoutPart(await this.currentSnapshot(window), point.scope);
+    return [planCheckout(now, point.before), planCheckout(point.before, now)].some(
+      plan =>
+        plan.open.length ||
+        plan.close.length ||
+        plan.update.length ||
+        plan.createSpaces.length ||
+        plan.createFolders.length
+    );
+  }
+
+  /**
+   * Adds a change to the reflog.
+   *
+   * @param {object} point From undoPoint().
+   * @param {{label: string, summary: string, note?: string}} details
+   */
+  recordUndo(point, { label, summary, note = null }) {
+    return this.#serialize(async () => {
+      const entry = undoEntry({
+        id: this.#undoId(),
+        at: Date.now(),
+        label,
+        summary,
+        note,
+        point,
+      });
+      await this.#writeUndoLog(addToLog(await this.#readUndoLog(), entry));
+    });
+  }
+
+  /** @returns {Promise<object[]>} The reflog, newest first. */
+  reflog() {
+    return this.#serialize(() => this.#readUndoLog());
+  }
+
+  /**
+   * Puts the spaces a change touched back the way they were, and switches
+   * their branches back.
+   *
+   * @param {Window} window
+   * @param {object} restore From combineUndo(), or an undo entry for redo.
+   * @param {{spaceIds: string[], essentials: boolean}} restore.scope
+   * @param {object} restore.target The layout to restore.
+   * @param {object} restore.branches Space id -> branch to be on.
+   * @returns {Promise<{summary: string, switched: string[], warnings: string[]}>}
+   */
+  async #restoreLayout(window, { scope, target, branches }) {
+    const warnings = [];
+    const switched = [];
+    for (const space of window.gZenWorkspaces.getWorkspaces()) {
+      const wanted = branches[space.uuid];
+      if (!wanted) {
+        continue;
+      }
+      try {
+        const { repo, slug } = await this.#spaceRepo(space);
+        if ((await repo.currentBranch()) !== wanted) {
+          await repo.resetWorkingTree();
+          await repo.git("switch", "-q", repo.fullBranch(wanted));
+          this.#heads.delete(slug);
+          switched.push(`${space.name} is back on branch '${wanted}'.`);
+        }
+      } catch (e) {
+        warnings.push(`could not switch ${space.name} back to '${wanted}': ${e.message}`);
+      }
+    }
+    const current = layoutPart(await this.currentSnapshot(window), scope);
+    const plan = planCheckout(current, target);
+    const result = await this.#apply(window, current, target);
+    this.#removeEmptyFolders(window, current, target);
+    await this.#refreshNow(window).catch(() => {});
+    return {
+      summary: describeRestore(plan),
+      switched,
+      warnings: [...warnings, ...result.warnings],
+    };
+  }
+
+  // Folders a change made (`tidy apply`) are removed when undoing it leaves
+  // them empty.
+  #removeEmptyFolders(window, current, target) {
+    const keep = new Set(target.spaces.flatMap(s => s.folders.map(f => f.id)));
+    for (const space of current.spaces) {
+      for (const { id } of space.folders) {
+        const folder = window.document.getElementById(id);
+        if (
+          keep.has(id) ||
+          !folder?.isZenFolder ||
+          folder.allItems.some(item => !item.hasAttribute("zen-empty-tab"))
+        ) {
+          continue;
+        }
+        folder.delete().catch(e => console.warn("Commit: undo folder:", e));
+      }
+    }
+  }
+
+  /**
+   * Undoes the newest `count` changes in the reflog.
+   *
+   * @param {Window} window
+   * @param {number} [count]
+   * @returns {Promise<{undone: object[], summary: string, switched: string[], warnings: string[]}|null>}
+   *   null when there is nothing to undo.
+   */
+  undo(window, count = 1) {
+    return this.#serialize(async () => {
+      const log = await this.#readUndoLog();
+      const entries = pickUndo(log, count);
+      if (!entries.length) {
+        return null;
+      }
+      const combined = combineUndo(entries);
+      const full = await this.currentSnapshot(window);
+      const point = {
+        scope: combined.scope,
+        before: layoutPart(full, combined.scope),
+        branches: Object.keys(combined.branches).length
+          ? await this.#branchesFor(window, combined.scope.spaceIds)
+          : {},
+        names: [...new Set(entries.flatMap(e => e.names))],
+      };
+      const result = await this.#restoreLayout(window, combined);
+      const ids = entries.map(e => e.id);
+      const entry = undoEntry({
+        id: this.#undoId(),
+        at: Date.now(),
+        kind: "undo",
+        label: count > 1 ? `undo ${entries.length}` : "undo",
+        summary: result.summary,
+        point,
+        undoes: ids,
+      });
+      await this.#writeUndoLog(
+        addToLog(updateEntries(log, ids, { undone: true }), entry)
+      );
+      return { undone: entries, ...result };
+    });
+  }
+
+  /**
+   * Reverses the newest undo, if nothing changed since.
+   *
+   * @param {Window} window
+   * @returns {Promise<{redone: object[], summary: string, switched: string[], warnings: string[]}|null>}
+   */
+  redo(window) {
+    return this.#serialize(async () => {
+      const log = await this.#readUndoLog();
+      const undo = pickRedo(log);
+      if (!undo) {
+        return null;
+      }
+      const result = await this.#restoreLayout(window, {
+        scope: undo.scope,
+        target: undo.before,
+        branches: undo.branches || {},
+      });
+      const redone = log.filter(e => undo.undoes.includes(e.id));
+      const entry = undoEntry({
+        id: this.#undoId(),
+        at: Date.now(),
+        kind: "redo",
+        label: "redo",
+        summary: result.summary,
+        point: { scope: undo.scope, before: undo.before, names: undo.names },
+      });
+      let next = updateEntries(log, undo.undoes, { undone: false });
+      next = updateEntries(next, [undo.id], { redone: true });
+      await this.#writeUndoLog(addToLog(next, entry));
+      return { redone, ...result };
+    });
+  }
+
+  // -------------------------------------------------------------------------
   // Time travel
 
   #timeRef(key) {
@@ -1527,19 +1864,11 @@ class nsZenGitManager {
           skipped.push(info);
           continue;
         }
-        const tab = gBrowser.addTab(info.url, {
-          triggeringPrincipal: principal,
-          createLazyBrowser: true,
-          skipAnimation: true,
-          inBackground: true,
-        });
-        try {
-          gBrowser.setInitialTabTitle(tab, info.title, { isContentTitle: true });
-        } catch {}
+        const tab = addLazyTab(gBrowser, info.url, info.title, principal);
         if (info.pinned) {
           gBrowser.pinTab(tab);
         }
-        gZenWorkspaces.moveTabToWorkspace(tab, space.uuid);
+        moveToSpace(gZenWorkspaces, tab, space.uuid);
         here.add(info.url);
         opened.push(info);
       }
